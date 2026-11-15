@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>Pay · {{ farm }}</title>
+<style>
+body{margin:0;font-family:system-ui,"Segoe UI","Noto Sans Telugu",sans-serif;background:#fafaf5;color:#22301f}
+.box{max-width:440px;margin:0 auto;padding:1rem}.hd{background:#2f7d32;color:#fff;padding:.8rem 1rem;font-weight:700}
+.card{background:#fff;border:1px solid #e3e8dc;border-radius:12px;padding:1rem;margin-top:1rem}
+.amt{font-size:2rem;font-weight:700;color:#1f5c24}.muted{color:#6b7766;font-size:.9rem}
+button,.btn{display:block;width:100%;background:#2f7d32;color:#fff;border:0;border-radius:10px;padding:.9rem;font-size:1.05rem;cursor:pointer;margin-top:.8rem;text-align:center;text-decoration:none}
+.btn.alt{background:#f7b500;color:#3a2c00}.ok{color:#1f5c24}.bad{color:#c0392b}
+</style></head><body><div class="hd">🥭 {{ farm }}</div><div class="box">
+<div class="card"><div class="muted">Order {{ order.order_code }} · ఆర్డర్ {{ order.order_code }}</div>
+<div class="amt">₹{{ payment.amount|money }}</div>
+<div class="muted">{{ order.items[0].product_name_en }} · {{ order.items[0].quantity|qty }} kg<br>{{ order.items[0].product_name_te }}</div></div>
+
+{% if payment.status == PAY_SUCCESS or payment.status == PAY_REFUNDED %}
+<div class="card"><h2 class="ok">✅ Payment received / చెల్లింపు అందింది</h2>
+<p>Your order is confirmed. We have sent the details on WhatsApp.<br>మీ ఆర్డర్ నిర్ధారించబడింది. వివరాలు WhatsApp లో పంపాము.</p>
+{% if payment.status == PAY_REFUNDED %}<p class="muted">This payment has been refunded.</p>{% endif %}</div>
+{% elif payment.status == PAY_EXPIRED %}
+<div class="card"><h2 class="bad">Payment link closed / లింక్ ముగిసింది</h2>
+<p>This payment link has expired or the order was cancelled. If money was deducted it will be refunded. Please place a new order on WhatsApp.<br>
+ఈ లింక్ ముగిసింది లేదా ఆర్డర్ రద్దయింది. డబ్బు కట్ అయి ఉంటే వెనక్కి వస్తుంది. దయచేసి WhatsApp లో కొత్త ఆర్డర్ ఇవ్వండి.</p></div>
+{% elif openable %}
+<div class="card">
+{% if mode == "return" %}<p>We could not confirm a successful payment yet.{% if payment.status == "FAILED" %} The last attempt failed.{% endif %}<br>
+చెల్లింపు ఇంకా నిర్ధారణ కాలేదు. మళ్ళీ ప్రయత్నించండి.</p>{% endif %}
+<p class="muted">Pay securely with UPI, card, net banking and more. Valid until {{ payment.expires_at|fdt }} IST.<br>UPI, కార్డ్, నెట్‌బ్యాంకింగ్ ద్వారా సురక్షితంగా చెల్లించండి.</p>
+{% if is_mock %}
+<p class="bad"><b>MOCK GATEWAY (development only)</b></p>
+{% for o, l in [('success','Simulate successful payment'),('failed','Simulate failed payment'),('expired','Simulate expiry')] %}
+<form method="post" action="/pay/{{ payment.checkout_token }}/mock/{{ o }}"><button class="{{ 'alt' if o != 'success' }}">{{ l }}</button></form>{% endfor %}
+{% else %}
+<button id="pay">Pay ₹{{ payment.amount|money }} / చెల్లించండి</button>
+<script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
+<script>
+document.getElementById('pay').onclick=function(){
+  var cf=Cashfree({mode:"{{ checkout_mode }}"});
+  cf.checkout({paymentSessionId:{{ payment.payment_session_id|tojson }},redirectTarget:"_self"});
+};
+</script>
+{% endif %}</div>
+{% else %}
+<div class="card"><h2>Payment not available</h2><p>This order is no longer waiting for payment.</p></div>
+{% endif %}
+<p class="muted" style="text-align:center">Payments are processed by Cashfree Payments. We never see your card or UPI PIN.</p>
+</div></body></html>

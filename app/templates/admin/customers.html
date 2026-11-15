@@ -1,0 +1,9 @@
+{% extends "admin/base.html" %}{% block title %}Customers{% endblock %}
+{% block content %}
+<h1>Customers</h1>
+<form class="card inline"><div><label>Search name / phone</label><input name="q" value="{{ q }}"></div><button class="btn">Search</button></form>
+<div class="tablewrap" style="margin-top:1rem"><table><tr><th>Name</th><th>Phone</th><th>Language</th><th>Village</th><th>Orders</th></tr>
+{% for c in customers %}<tr><td><a href="/admin/customers/{{ c.id }}">{{ c.name or '(not given)' }}</a></td><td>{{ c.whatsapp_number|phone }}</td>
+<td>{{ {'te':'తెలుగు','en':'English'}.get(c.language, '-') }}</td><td>{{ c.village.name_en if c.village else '-' }}</td><td>{{ c.orders|length }}</td></tr>
+{% else %}<tr><td colspan="5" class="muted">No customers yet.</td></tr>{% endfor %}</table></div>
+{% endblock %}

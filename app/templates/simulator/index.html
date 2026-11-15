@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WhatsApp Simulator · Mango Farm</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,"Segoe UI","Noto Sans Telugu",sans-serif;background:#d9d2c5;display:flex;justify-content:center}
+.phone{width:100%;max-width:440px;height:100vh;display:flex;flex-direction:column;background:#efe7dc}
+header{background:#075e54;color:#fff;padding:.6rem .8rem;display:flex;gap:.5rem;align-items:center}
+header b{flex:1}header input{width:130px;padding:.25rem;border-radius:6px;border:0}
+header button{background:#25d366;border:0;border-radius:6px;padding:.3rem .6rem;cursor:pointer}
+#chat{flex:1;overflow-y:auto;padding:.7rem;display:flex;flex-direction:column;gap:.4rem}
+.m{max-width:85%;padding:.45rem .65rem;border-radius:10px;white-space:pre-wrap;word-wrap:break-word;box-shadow:0 1px 1px #0002;font-size:.95rem}
+.in{align-self:flex-end;background:#dcf8c6}.out{align-self:flex-start;background:#fff}.m img{width:100%;border-radius:8px;display:block;margin-bottom:.3rem}
+.opts{display:flex;flex-direction:column;gap:.3rem;margin-top:.5rem}
+.opts button{background:#fff;color:#0a7cff;border:1px solid #cfe3ff;border-radius:8px;padding:.45rem;cursor:pointer;font:inherit;text-align:left}
+.opts button small{display:block;color:#667;font-size:.78rem}.opts button:disabled{color:#999;border-color:#eee;cursor:default;background:#fafafa}
+.err{color:#c0392b;font-size:.8rem}.tag{font-size:.7rem;color:#888;margin-top:.2rem}
+form{display:flex;gap:.4rem;padding:.5rem;background:#f0f0f0}form input{flex:1;padding:.6rem;border-radius:20px;border:1px solid #ccc;font:inherit}
+form button{background:#075e54;color:#fff;border:0;border-radius:50%;width:42px;cursor:pointer;font-size:1.1rem}
+.note{font-size:.72rem;text-align:center;color:#666;padding:.2rem;background:#fff8dc}
+</style></head><body><div class="phone">
+<header><b>🥭 Mango Farm</b><input id="phone" value="919000000001" inputmode="numeric" aria-label="Customer phone"><button id="reset">Reset</button></header>
+<div class="note">Local simulator — same engine as real WhatsApp. Say "Hi" to start. Replies like 1, 2, 3 also work.</div>
+<div id="chat"></div>
+<form id="f"><input id="text" autocomplete="off" placeholder="Type a message (Hi / నమస్కారం)…"><button aria-label="Send">➤</button></form>
+</div>
+<script>
+const $=id=>document.getElementById(id);let last=0,timer=null,busy=false;
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=s=>esc(s).replace(/\*([^*\n]+)\*/g,'<b>$1</b>');
+const phone=()=>$('phone').value.replace(/\D/g,'');
+async function api(url,body){const r=await fetch(url,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});
+ if(!r.ok){const e=await r.text();throw new Error(r.status+' '+e.slice(0,120));}return r.json();}
+function render(msgs){const chat=$('chat');if(!msgs.length)return;
+ chat.querySelectorAll('.opts button').forEach(b=>b.disabled=true);
+ for(const m of msgs){const d=document.createElement('div');d.className='m '+(m.direction==='IN'?'in':'out');const c=m.content||{};
+  if(m.direction==='IN'){d.innerHTML=fmt(c.text||c.reply_id||'');}
+  else{let h='';if(c.kind==='image'&&c.image_url)h+=`<img src="${esc(c.image_url)}" alt="">`;
+   h+=fmt(c.body||'');if(c.kind==='template')h+='<div class="tag">📨 sent as approved template (outside 24h window)</div>';
+   if(m.status==='failed')h+='<div class="err">Delivery failed</div>';d.innerHTML=h;
+   if((c.options||[]).length){const o=document.createElement('div');o.className='opts';
+    c.options.forEach((op,i)=>{const b=document.createElement('button');b.innerHTML=`${i+1}. ${esc(op.title)}`+(op.desc?`<small>${esc(op.desc)}</small>`:'');
+     b.onclick=()=>send(op.title,op.id);o.appendChild(b);});d.appendChild(o);}
+   if(c.footer){const f=document.createElement('div');f.className='tag';f.textContent=c.footer;d.appendChild(f);}}
+  chat.appendChild(d);}chat.scrollTop=chat.scrollHeight;}
+async function send(text,reply_id){if(busy)return;busy=true;try{const r=await api('/simulator/api/send',{phone:phone(),text,reply_id:reply_id||null,after:last});last=r.last_id;render(r.messages);}catch(e){alert(e.message)}busy=false;}
+async function poll(){if(busy)return;try{const r=await api(`/simulator/api/messages?phone=${phone()}&after=${last}`);if(r.messages.length){last=r.last_id;render(r.messages);}}catch(e){}}
+function restart(){$('chat').innerHTML='';last=0;poll();}
+$('f').onsubmit=e=>{e.preventDefault();const t=$('text').value.trim();if(!t)return;$('text').value='';send(t,null);};
+$('reset').onclick=async()=>{await api('/simulator/api/reset',{phone:phone()});restart();};
+$('phone').onchange=restart;restart();timer=setInterval(poll,2500);
+</script></body></html>

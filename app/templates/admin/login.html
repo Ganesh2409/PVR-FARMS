@@ -1,0 +1,8 @@
+{% extends "admin/base.html" %}{% block title %}Login{% endblock %}
+{% block content %}
+<div class="card"><h1>🥭 Mango Farm</h1><p class="muted">Administrator login</p>
+<form method="post" action="/admin/login"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<label>Username</label><input name="username" autocomplete="username" required autofocus>
+<label>Password</label><input type="password" name="password" autocomplete="current-password" required>
+<p><button class="btn">Log in</button></p></form></div>
+{% endblock %}

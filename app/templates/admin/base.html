@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Admin{% endblock %} · Mango Farm</title>
+<link rel="stylesheet" href="/static/style.css"></head>
+<body>
+{% if admin %}
+<div class="topbar"><button class="menu-btn" onclick="document.querySelector('nav.side').classList.toggle('open')" aria-label="Menu">☰</button>
+<span class="brand">🥭 Mango Farm Admin</span>
+<form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="btn sm alt">Log out ({{ admin.username }})</button></form></div>
+<div class="layout"><nav class="side">
+{% for key, label, url in [('overview','Overview','/admin'),('orders','Orders','/admin/orders'),('products','Products & Stock','/admin/products'),('delivery','Delivery','/admin/delivery'),('customers','Customers','/admin/customers'),('settings','Settings','/admin/settings'),('audit','Audit log','/admin/audit')] %}
+<a href="{{ url }}" class="{{ 'on' if nav == key }}">{{ label }}</a>{% endfor %}
+<a href="/simulator" target="_blank">WhatsApp simulator ↗</a></nav><main>
+{% else %}<div class="login">{% endif %}
+{% for kind, msg in flashes %}<div class="flash {{ kind }}">{{ msg }}</div>{% endfor %}
+{% block content %}{% endblock %}
+{% if admin %}</main></div>{% else %}</div>{% endif %}
+</body></html>

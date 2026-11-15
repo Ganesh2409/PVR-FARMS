@@ -1,0 +1,35 @@
+{% extends "admin/base.html" %}{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<form method="post" action="/admin/settings" class="card"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<div class="grid2">
+<div><label>Farm name</label><input name="farm_name" value="{{ values.farm_name }}"></div>
+<div><label>Contact number (shown to customers)</label><input name="contact_number" value="{{ values.contact_number }}"></div>
+<div><label>Business address</label><input name="business_address" value="{{ values.business_address }}"></div>
+<div><label>Business hours</label><input name="business_hours" value="{{ values.business_hours }}"></div>
+<div><label>Default language</label><select name="default_language"><option value="te" {{ 'selected' if values.default_language == 'te' }}>తెలుగు</option><option value="en" {{ 'selected' if values.default_language == 'en' }}>English</option></select></div>
+<div><label>Notify this WhatsApp number of new orders (optional)</label><input name="admin_notify_phone" value="{{ values.admin_notify_phone }}" placeholder="10-digit mobile"></div>
+</div>
+<label class="check"><input type="checkbox" name="accepting_orders" {{ 'checked' if values.accepting_orders == 'true' }}> Accepting new orders</label>
+<label class="check"><input type="checkbox" name="cod_enabled" {{ 'checked' if values.cod_enabled == 'true' }}> Cash on Delivery switched on (off by default; customers must <i>also</i> be allowed individually on their customer page)</label>
+<p><button class="btn">Save settings</button></p></form>
+
+<h2>WhatsApp configuration</h2>
+<div class="card"><p class="muted">Credentials are read from server environment variables (<code>.env</code>) and are never shown or stored here.</p>
+<dl class="kv"><dt>Access token + phone ID</dt><dd>{{ '✅ configured' if wa.configured else '❌ missing' }}</dd>
+<dt>Verify token</dt><dd>{{ '✅ set' if wa.verify_token else '❌ missing' }}</dd><dt>App secret</dt><dd>{{ '✅ set' if wa.app_secret else '❌ missing (webhooks will be rejected)' }}</dd>
+<dt>API version</dt><dd>{{ wa.version }}</dd><dt>Template</dt><dd>{{ wa.template or 'not set (status messages outside the 24h window cannot be sent)' }}</dd>
+<dt>Webhook URL</dt><dd>{{ (wa.public_url or 'https://YOUR-DOMAIN') }}/webhook</dd></dl></div>
+
+<h2>Payment gateway</h2>
+<div class="card"><p class="muted">Read from environment variables; secrets are never shown.</p><dl class="kv">
+<dt>Provider</dt><dd>{{ pay.provider }}{% if pay.provider == 'mock' %} <b style="color:#c0392b">(development mock)</b>{% endif %}</dd>
+<dt>Cashfree mode</dt><dd>{{ pay.env }}</dd><dt>Credentials</dt><dd>{{ '✅ set' if pay.configured else '❌ missing' }}</dd>
+<dt>API version</dt><dd>{{ pay.version }}</dd><dt>Link validity</dt><dd>{{ pay.expiry }} minutes</dd>
+<dt>Webhook URL for Cashfree</dt><dd>{{ pay.webhook }}</dd></dl></div>
+
+<h2>Change password</h2>
+<form method="post" action="/admin/password" class="card inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<div><label>Current password</label><input type="password" name="old_password" required autocomplete="current-password"></div>
+<div><label>New password (10+ characters)</label><input type="password" name="new_password" required minlength="10" autocomplete="new-password"></div><button class="btn">Change</button></form>
+{% endblock %}

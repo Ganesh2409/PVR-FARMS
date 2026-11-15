@@ -1,0 +1,14 @@
+{% extends "admin/base.html" %}{% block title %}Products{% endblock %}
+{% block content %}
+<h1>Products &amp; stock <a class="btn sm" href="/admin/products/new">+ Add product</a></h1>
+<div class="tablewrap"><table><tr><th></th><th>Name</th><th>₹ / kg</th><th>Min–Max</th><th>On hand</th><th>Reserved</th><th>Available</th><th>Status</th><th></th></tr>
+{% for p in products %}<tr>
+<td>{% if p.image_path %}<img class="thumb" src="/media/{{ p.image_path }}" alt="">{% else %}<div class="thumb"></div>{% endif %}</td>
+<td><b>{{ p.name_en }}</b><br><span class="muted">{{ p.name_te }}</span></td><td>₹{{ p.price_per_kg|money }}</td>
+<td>{{ p.min_qty|qty }}–{{ (p.max_qty|qty) if p.max_qty else '∞' }}</td>
+<td>{{ p.inventory.quantity_on_hand|qty if p.inventory else 0 }}</td><td>{{ p.inventory.quantity_reserved|qty if p.inventory else 0 }}</td>
+<td>{{ p.available_qty|qty }}</td><td><span class="badge {{ 'b-DELIVERED' if p.is_active else 'b-CANCELLED' }}">{{ 'Active' if p.is_active else 'Disabled' }}</span></td>
+<td><a class="btn sm ghost" href="/admin/products/{{ p.id }}">Edit</a>
+<form method="post" action="/admin/products/{{ p.id }}/toggle" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="btn sm ghost">{{ 'Disable' if p.is_active else 'Enable' }}</button></form></td></tr>
+{% endfor %}</table></div>
+{% endblock %}

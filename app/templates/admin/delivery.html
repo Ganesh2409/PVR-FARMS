@@ -1,0 +1,33 @@
+{% extends "admin/base.html" %}{% block title %}Delivery{% endblock %}
+{# Inputs in table rows use the HTML5 `form` attribute pointing at a <form> in the last cell (valid HTML). #}
+{% macro rowform(fid, action, id=None) %}<form id="{{ fid }}" method="post" action="{{ action }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">{% if id %}<input type="hidden" name="id" value="{{ id }}">{% endif %}</form>{% endmacro %}
+{% block content %}
+<h1>Delivery management</h1>
+<h2>Delivery dates</h2>
+<form method="post" action="/admin/delivery/dates" class="card inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<div><label>From date</label><input type="date" name="start" required></div><div><label>To date (optional)</label><input type="date" name="end"></div>
+<div><label>Max orders per day</label><input type="number" name="max_orders" value="20" min="1"></div>
+<label class="check"><input type="checkbox" name="slots_enabled"> Use time slots</label><button class="btn">Add date(s)</button></form>
+<div class="tablewrap" style="margin-top:.8rem"><table><tr><th>Date</th><th>Booked</th><th>Capacity</th><th>Slots</th><th>Open</th><th></th></tr>
+{% for d in dates %}{% set f = 'fd' ~ d.id %}<tr><td>{{ d.date|fdate }}</td><td>{{ booked.get(d.date, 0) }}</td>
+<td><input form="{{ f }}" name="max_orders" type="number" min="0" value="{{ d.max_orders }}" style="width:80px"></td>
+<td><input form="{{ f }}" type="checkbox" name="slots_enabled" {{ 'checked' if d.slots_enabled }}></td><td><input form="{{ f }}" type="checkbox" name="is_active" {{ 'checked' if d.is_active }}></td>
+<td>{{ rowform(f, '/admin/delivery/dates/' ~ d.id) }}<button form="{{ f }}" class="btn sm ghost">Save</button></td></tr>
+{% else %}<tr><td colspan="6" class="muted">No delivery dates yet. Customers cannot order until you add some.</td></tr>{% endfor %}</table></div>
+
+<h2>Time slots</h2><div class="tablewrap"><table><tr><th>English</th><th>తెలుగు</th><th>Max/day</th><th>Order</th><th>Active</th><th></th></tr>
+{% for s in slots %}{% set f = 'fs' ~ s.id %}<tr>
+<td><input form="{{ f }}" name="name_en" value="{{ s.name_en }}"></td><td><input form="{{ f }}" name="name_te" value="{{ s.name_te }}"></td>
+<td><input form="{{ f }}" name="max_orders" type="number" min="1" value="{{ s.max_orders or '' }}" style="width:80px"></td><td><input form="{{ f }}" name="sort_order" type="number" value="{{ s.sort_order }}" style="width:70px"></td>
+<td><input form="{{ f }}" type="checkbox" name="is_active" {{ 'checked' if s.is_active }}></td><td>{{ rowform(f, '/admin/delivery/slots', s.id) }}<button form="{{ f }}" class="btn sm ghost">Save</button></td></tr>{% endfor %}
+<tr><td><input form="fsn" name="name_en" placeholder="New slot"></td><td><input form="fsn" name="name_te"></td><td><input form="fsn" name="max_orders" type="number" min="1" style="width:80px"></td><td><input form="fsn" name="sort_order" type="number" value="0" style="width:70px"></td><td></td>
+<td>{{ rowform('fsn', '/admin/delivery/slots') }}<button form="fsn" class="btn sm">Add</button></td></tr></table></div>
+
+<h2>Villages &amp; delivery charges</h2><div class="tablewrap"><table><tr><th>English</th><th>తెలుగు</th><th>Charge ₹</th><th>Active</th><th></th></tr>
+{% for a in areas %}{% set f = 'fa' ~ a.id %}<tr>
+<td><input form="{{ f }}" name="name_en" value="{{ a.name_en }}"></td><td><input form="{{ f }}" name="name_te" value="{{ a.name_te }}"></td>
+<td><input form="{{ f }}" name="delivery_charge" inputmode="decimal" value="{{ a.delivery_charge|money }}" style="width:90px"></td>
+<td><input form="{{ f }}" type="checkbox" name="is_active" {{ 'checked' if a.is_active }}></td><td>{{ rowform(f, '/admin/delivery/areas', a.id) }}<button form="{{ f }}" class="btn sm ghost">Save</button></td></tr>{% endfor %}
+<tr><td><input form="fan" name="name_en" placeholder="New village"></td><td><input form="fan" name="name_te"></td>
+<td><input form="fan" name="delivery_charge" inputmode="decimal" value="0" style="width:90px"></td><td></td><td>{{ rowform('fan', '/admin/delivery/areas') }}<button form="fan" class="btn sm">Add</button></td></tr></table></div>
+{% endblock %}

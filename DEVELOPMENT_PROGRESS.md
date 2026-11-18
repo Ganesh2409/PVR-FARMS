@@ -65,3 +65,35 @@ Manually: mock online order in the simulator → pay page → *Simulate success*
 
 ### Exact next step
 On the other computer follow `docs/WINDOWS_SETUP.md` steps 1–7 (mock provider, `pytest`), then step 8 with your Cashfree **sandbox** keys and a tunnel, and report what differs from the README (especially the first real `POST /pg/orders` response and the first real webhook).
+
+
+---
+
+## Session 3 - COD admin verification + customer cancellation
+
+### Audit of the code before changing it
+* COD already existed but confirmed instantly ("successfully placed") and a placed order could only be cancelled by `cancel MF-...` while COD+`PENDING`. Bare `cancel` only reset the menu. Prepaid-paid, confirmed and dispatched orders could not be cancelled by the customer; customer actions were not audited; there was no cancelled-by / cancel-request record.
+* Refund logic itself was sound (`REFUNDED` only after gateway `SUCCESS`) but was triggered only from the admin route after commit (no retry if the app stopped in between).
+* Bugs found and fixed: a late payment revived an order the customer/admin had **cancelled** (now refunded; only an *expired* order can be revived); admin-cancelling an unpaid online order left the payment open; checkout failures were not logged ("online payment could not be started" had no visible cause); WhatsApp template variables could contain line breaks (Meta rejects them).
+
+### Changes
+* Reused statuses: `PENDING` = *Awaiting Confirmation*, `ACCEPTED` = *Confirmed* (no duplicate `PENDING_CONFIRMATION`). Migration `0002` adds 4 nullable columns to `orders` (`cancelled_by`, `cancel_requested_at`, `confirmed_at`, `confirmed_by`).
+* COD: acknowledgement message (EN/TE) instead of confirmation; admin *Awaiting Confirmation* list with Confirm / Reject / View Details; confirmation message on admin confirm; audit trail; idempotent under row locks.
+* Cancellation service (`services/cancellation.py`) for cases A-F with confirmation step, gateway re-verification, full refund request for paid orders, dispatched-request flow with admin alert, delivered refusal, duplicate/stale-button handling.
+* Central audit in `change_status` (actor, previous -> new status, payment/refund state); refund request/confirm/failure audited; sweeper retries refunds for cancelled paid orders.
+* Admin: status labels, new filters (Confirmed, Dispatched, Delivered, Refunds pending, Refunded, Cancel requests), order History, cancel-request banner, overview counters.
+* Deployment guide: `docs/DEPLOY_CHANGES_TO_RAILWAY.md` (includes the exact Meta template to create).
+
+### Tests executed
+`python -m pytest -q` on PostgreSQL 16.4 (throwaway local server, role `mango_app`, test database only): **177 passed** (137 earlier + 40 new in `tests/test_cod_and_cancellation.py`; 9 older assertions updated for the new wording/flow). Mutation check: three deliberate breakages (revive cancelled order, mark REFUNDED too early, auto-cancel a dispatched order) were each caught by a test. Migration `0002` verified on a database containing an order and payment (data preserved, downgrade/upgrade OK).
+
+### Known limitations / not verified
+* **Not verified against real Cashfree, real WhatsApp, Railway, or PostgreSQL 17.** Mocked gateway/messaging only. Cancellation/refund against Cashfree is untested live (refund request/status shapes come from docs).
+* The workspace is not a Git repository; the files must be copied into your real repo (see the deployment doc). I could not see local edits you may have made elsewhere.
+* Admin alerts to the "notify number" use a plain WhatsApp text and so only arrive inside the admin's 24-hour window; customer messages after 24 h need the approved template (not yet created).
+* The customer chat state after an admin confirms later is not changed (customer can always send `cancel`).
+* No complaint/return workflow after delivery (by design, later).
+* Visual check of the new admin pages was done through rendered-HTML assertions, not in a browser.
+
+### Exact next step
+Read `docs/DEPLOY_CHANGES_TO_RAILWAY.md`, copy the listed files into your repo, run `python -m pytest -q` against `mango_farm_test`, then tell me to proceed (or what differs) before anything is pushed or deployed.

@@ -18,6 +18,7 @@ from app.config import get_settings
 from app.models import (AWAITING_PAYMENT, CANCELLED, PAY_EXPIRED, PAY_FAILED, PAY_PENDING, PAY_REFUNDED, PAY_SUCCESS,
                         PENDING, Order, Payment)
 from app.services import notifications
+from app.services.core import audit
 from app.services.gateways import GatewayError, GatewayStatus, get_gateway
 from app.services.orders import OrderError, change_status, revive_cancelled_order
 from app.utils import utcnow
@@ -48,8 +49,13 @@ def start_checkout(db: Session, order: Order) -> Payment:
     On failure the caller must cancel the order (releasing stock)."""
     s = get_settings()
     if not s.public_base_url.startswith("http"):
+        log.error("Online payment cannot start for %s: PUBLIC_BASE_URL is not set", order.order_code)
         raise PaymentError("not_configured", "PUBLIC_BASE_URL is required for online payments")
-    gw = get_gateway()  # may raise GatewayError (unconfigured)
+    try:
+        gw = get_gateway()
+    except GatewayError as exc:
+        log.error("Online payment cannot start for %s: %s", order.order_code, exc)
+        raise PaymentError("not_configured", str(exc)) from exc
     base = s.public_base_url.rstrip("/")
     payment = Payment(
         order_id=order.id, provider=gw.name, provider_order_id=order.order_code,
@@ -140,7 +146,8 @@ def _apply_status(db: Session, payment_id: int, gs: GatewayStatus) -> list:
         if order.status == AWAITING_PAYMENT:
             order.status = PENDING
             events.append((notifications.notify_order_confirmed, order.id))
-        elif order.status == CANCELLED and revive_cancelled_order(db, order):
+        elif (order.status == CANCELLED and payment.closed_reason == "EXPIRED"
+              and revive_cancelled_order(db, order)):  # never revive an order someone chose to cancel
             payment.closed_reason = None
             events.append((notifications.notify_order_confirmed, order.id))
         else:
@@ -150,6 +157,10 @@ def _apply_status(db: Session, payment_id: int, gs: GatewayStatus) -> list:
         return events
 
     if payment.status in (PAY_SUCCESS, PAY_REFUNDED):
+        db.commit()
+        return events
+
+    if payment.closed_reason:  # already closed (expired / cancelled / failed): keep the original reason
         db.commit()
         return events
 
@@ -175,14 +186,15 @@ def _apply_status(db: Session, payment_id: int, gs: GatewayStatus) -> list:
     return events
 
 
-def _close(db: Session, payment: Payment, order: Order, reason: str, terminate: bool = False) -> list:
+def _close(db: Session, payment: Payment, order: Order, reason: str, terminate: bool = False, *,
+           actor: str = "system", cancelled_by: str = "SYSTEM") -> list:
     """Payment will never succeed: mark it closed and cancel the unpaid order, releasing its stock."""
     events: list = []
     payment.status = PAY_EXPIRED if reason in ("EXPIRED", "CANCELLED") else PAY_FAILED
     payment.closed_reason = reason
     if order.status == AWAITING_PAYMENT:
         text = {"EXPIRED": "Payment expired", "CANCELLED": "Payment cancelled", "FAILED": "Payment failed"}[reason]
-        change_status(db, order, CANCELLED, text, commit=False)
+        change_status(db, order, CANCELLED, text, commit=False, actor=actor, cancelled_by=cancelled_by)
         events.append((notifications.notify_payment_closed, order.id, reason))
     db.commit()
     if terminate:
@@ -198,7 +210,7 @@ def _terminate(db: Session, payment_id: int) -> None:
         log.info("terminate_order not applied for %s: %s", p.provider_order_id, exc)  # best effort
 
 
-def cancel_checkout(db: Session, order_id: int) -> str:
+def cancel_checkout(db: Session, order_id: int, *, actor: str = "system", cancelled_by: str = "SYSTEM") -> str:
     """Customer cancels an unpaid online order. Verifies with the gateway first so a payment that
     just went through is never discarded. Returns 'cancelled' or 'paid'."""
     order = db.get(Order, order_id)
@@ -214,7 +226,7 @@ def cancel_checkout(db: Session, order_id: int) -> str:
         p = db.scalar(select(Payment).where(Payment.id == payment.id).with_for_update().execution_options(populate_existing=True))
         o = db.scalar(select(Order).where(Order.id == order_id).with_for_update().execution_options(populate_existing=True))
         if o.status == AWAITING_PAYMENT and p.status != PAY_SUCCESS:
-            events = _close(db, p, o, "CANCELLED", terminate=True)
+            events = _close(db, p, o, "CANCELLED", terminate=True, actor=actor, cancelled_by=cancelled_by)
         else:
             db.rollback()
         for fn, *args in events:
@@ -228,7 +240,7 @@ def _auto_refund(db: Session, payment_id: int, note: str) -> None:
 
 
 # ------------------------------------------------------------------ refunds
-def refund_payment(db: Session, payment_id: int, note: str = "Refund") -> Payment:
+def refund_payment(db: Session, payment_id: int, note: str = "Refund", actor: str = "system") -> Payment:
     """Full refund of a verified payment. Idempotent: the refund_id is fixed per payment."""
     payment = db.scalar(select(Payment).where(Payment.id == payment_id).with_for_update()
                         .execution_options(populate_existing=True))
@@ -245,9 +257,12 @@ def refund_payment(db: Session, payment_id: int, note: str = "Refund") -> Paymen
     except GatewayError as exc:
         payment.refund_status = "FAILED"
         payment.needs_attention = f"REFUND_FAILED: {str(exc)[:150]}"
+        audit(db, actor, "refund_failed", "order", payment.provider_order_id, str(exc)[:200])
         db.commit()
         raise PaymentError("gateway_error", str(exc)) from exc
     _set_refund_status(db, payment, r.status)
+    audit(db, actor, "refund_requested", "order", payment.provider_order_id,
+          f"{payment.refund_id} amount={payment.amount} gateway_status={r.status} | {note}")
     db.commit()
     return payment
 
@@ -271,18 +286,22 @@ def sync_refund(db: Session, payment_id: int) -> Payment:
     payment = db.scalar(select(Payment).where(Payment.id == payment_id).with_for_update().execution_options(populate_existing=True))
     if payment.status != PAY_REFUNDED:
         _set_refund_status(db, payment, r.status)
+        if payment.status == PAY_REFUNDED:
+            audit(db, "system", "refund_confirmed", "order", payment.provider_order_id,
+                  f"{payment.refund_id} confirmed by gateway")
         db.commit()
         if payment.status == PAY_REFUNDED:
             notifications.notify_refunded(db, payment.order_id)
     return payment
 
 
-def refund_if_paid(db: Session, order: Order, note: str) -> None:
-    """Called after an admin rejects/cancels an order: a verified online payment is refunded in full."""
+def refund_if_paid(db: Session, order: Order, note: str, actor: str = "system") -> None:
+    """After an order is rejected/cancelled: a verified online payment is refunded in full.
+    A failure is recorded on the payment and retried by the sweeper; it never undoes the cancellation."""
     p = order.payment
     if p is not None and p.status == PAY_SUCCESS:
         try:
-            refund_payment(db, p.id, note)
+            refund_payment(db, p.id, note, actor)
         except PaymentError as exc:
             log.error("auto refund failed for %s: %s", order.order_code, exc)
 
@@ -296,7 +315,20 @@ def run_maintenance(db: Session, limit: int = 50) -> int:
         .order_by(Payment.id).limit(limit)).all()
     refund_ids = db.scalars(select(Payment.id).where(Payment.status == PAY_SUCCESS, Payment.refund_status.in_(
         ["PENDING", "PENDING_APPROVAL", "ONHOLD"])).limit(limit)).all()
+    unrefunded_ids = db.scalars(
+        select(Payment.id).join(Order, Order.id == Payment.order_id)
+        .where(Payment.status == PAY_SUCCESS, Order.status.in_(["CANCELLED", "REJECTED"]),
+               (Payment.refund_id.is_(None)) | (Payment.refund_status.in_(["FAILED", "REJECTED", "CANCELLED"])))
+        .order_by(Payment.id).limit(limit)).all()
     db.rollback()
+    for pid in unrefunded_ids:
+        try:
+            refund_payment(db, pid, "Order cancelled - automatic refund retry")
+        except PaymentError:
+            pass  # recorded on the payment (needs_attention); shown in the admin "Refunds" view
+        except Exception:
+            log.exception("refund retry failed for payment %s", pid)
+            db.rollback()
     for pid in open_ids:
         try:
             sync_payment(db, pid)
@@ -309,4 +341,4 @@ def run_maintenance(db: Session, limit: int = 50) -> int:
         except Exception:
             log.exception("sweep refund sync failed for payment %s", pid)
             db.rollback()
-    return len(open_ids) + len(refund_ids)
+    return len(open_ids) + len(refund_ids) + len(unrefunded_ids)

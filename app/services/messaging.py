@@ -153,6 +153,8 @@ def send_notification(db: Session, customer: Customer, text: str, template_param
     if customer.channel != "whatsapp" or window_open(db, customer):
         send_messages(db, customer, [OutMessage("text", text)])
         return "sent"
+    # Meta rejects template variables containing line breaks, tabs or long runs of spaces: flatten them.
+    template_params = [" ".join(str(p).split())[:1000] for p in template_params]
     res = SendResult()
     if not s.whatsapp_template_order_update:
         res.error = "Outside 24h window and WHATSAPP_TEMPLATE_ORDER_UPDATE is not configured"

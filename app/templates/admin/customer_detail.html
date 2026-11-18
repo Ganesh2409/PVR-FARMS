@@ -7,7 +7,7 @@
 <label class="check"><input type="checkbox" name="cod_allowed" {{ 'checked' if c.cod_allowed }}> Allow Cash on Delivery for this customer</label><button class="btn sm">Save</button></form>
 <h2>Order history ({{ c.orders|length }})</h2>
 <div class="tablewrap"><table><tr><th>Order</th><th>Total</th><th>Delivery</th><th>Status</th></tr>
-{% for o in c.orders %}<tr><td><a href="/admin/orders/{{ o.id }}">{{ o.order_code }}</a></td><td>₹{{ o.total|money }}</td><td>{{ o.delivery_date|fdate }}</td><td><span class="badge b-{{ o.status }}">{{ o.status }}</span></td></tr>
+{% for o in c.orders %}<tr><td><a href="/admin/orders/{{ o.id }}">{{ o.order_code }}</a></td><td>₹{{ o.total|money }}</td><td>{{ o.delivery_date|fdate }}</td><td><span class="badge b-{{ o.status }}">{{ o.status|status_label }}</span></td></tr>
 {% else %}<tr><td colspan="4" class="muted">No orders.</td></tr>{% endfor %}</table></div>
 <p><a href="/admin/customers">← All customers</a></p>
 {% endblock %}

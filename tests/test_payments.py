@@ -113,7 +113,7 @@ def test_cod_flow_still_works_when_allowed(db):
     assert "Cash on Delivery" in chat.last[0].body and "Confirm Order" in " ".join(o.title for m in chat.last for o in m.options)
     chat.pick("confirm_order")
     o = db.scalar(select(Order))
-    assert o.status == PENDING and o.payment_method == "COD" and "Payment Method: Cash on Delivery." in chat.text
+    assert o.status == PENDING and o.payment_method == "COD" and "waiting for confirmation" in chat.text
     assert db.scalar(select(func.count(Payment.id))) == 0
 
 
@@ -401,20 +401,26 @@ def test_customer_cancels_unpaid_order(db):
 def test_customer_cancel_by_text_command(db):
     chat, order = place_online(db)
     chat.say("cancel")
+    assert "Do you want to cancel order" in chat.text
+    chat.pick("cancel_yes")
     reload(db)
     assert db.get(Order, order.id).status == CANCELLED
     chat.say(f"cancel {order.order_code}")  # already cancelled: harmless
+    assert "already cancelled" in chat.text
     reload(db)
     assert db.get(Order, order.id).status == CANCELLED
 
 
 def test_cancel_never_discards_a_payment_that_just_succeeded(db):
+    """Paid a moment before the customer cancelled: the money is verified and REFUNDED, never lost."""
     chat, order = place_online(db)
     MockGateway.simulate(order.order_code, "success")  # paid, webhook not yet processed
     chat.pick("cancel_payment")
     reload(db)
-    assert db.get(Order, order.id).status == PENDING and db.scalar(select(Payment.status)) == "SUCCESS"
-    assert any("successfully placed" in b for b in out_bodies(db))
+    p = db.scalar(select(Payment))
+    assert db.get(Order, order.id).status == CANCELLED and reserved(db) == 0
+    assert p.cf_payment_id == "mockpay1" and p.refund_id == f"RF-{order.order_code}" and p.status == "REFUNDED"
+    assert "refunding the ₹150" in chat.text
 
 
 def test_payment_pending_chat_reports_status_instead_of_trusting_claims(db):

@@ -36,8 +36,10 @@ def test_full_english_journey_creates_order(chat, db):
     o = orders(db)[0]
     assert re.fullmatch(r"MF-\d{8}-\d{4}", o.order_code)
     assert o.status == "PENDING" and o.total == Decimal("150.00") and o.payment_method == "COD"
-    assert "Your order has been successfully placed!" in chat.text and o.order_code in chat.text
-    assert "Payment Method: Cash on Delivery." in chat.text
+    # COD is only an acknowledgement: the family must call and confirm first
+    assert "Your PVR Farms order has been received successfully." in chat.text and o.order_code in chat.text
+    assert "waiting for confirmation" in chat.text and "call you shortly" in chat.text
+    assert "successfully placed" not in chat.text and o.confirmed_at is None
     inv = db.scalar(select(Inventory).where(Inventory.product_id == 1))
     assert inv.quantity_reserved == Decimal("2") and inv.quantity_on_hand == Decimal("200")
 
@@ -46,9 +48,8 @@ def test_full_telugu_journey(chat, db):
     drive_to_review(chat, "te")
     assert "మొత్తం చెల్లించాల్సింది: ₹150" in chat.last[0].body
     chat.pick("confirm_order")
-    assert "మీ ఆర్డర్ విజయవంతంగా నమోదు చేయబడింది!" in chat.text
-    assert "నమస్కారం Ravi Kumar గారు!" in chat.text
-    assert re.search(r"\d{2}-\d{2}-\d{4}", chat.text)  # DD-MM-YYYY
+    assert "మీ PVR Farms ఆర్డర్ మాకు అందింది" in chat.text
+    assert "ఇంకా నిర్ధారణ కాలేదు" in chat.text and "ఫోన్ చేస్తారు" in chat.text
 
 
 def test_snapshot_survives_price_change(chat, db):
@@ -159,7 +160,9 @@ def test_customer_cancels_placed_pending_order_by_text(chat, db):
     drive_to_review(chat).pick("confirm_order")
     code = orders(db)[0].order_code
     chat.say(f"cancel {code}")
-    assert f"Order {code} has been cancelled" in chat.text
+    assert "Do you want to cancel order" in chat.text  # asks first
+    chat.pick("cancel_yes")
+    assert f"Your order {code} has been cancelled as you asked" in chat.text
     o = orders(db)[0]
     assert o.status == CANCELLED
     assert db.scalar(select(Inventory.quantity_reserved).where(Inventory.product_id == 1)) == 0

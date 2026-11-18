@@ -17,13 +17,13 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.i18n import CMD_BACK, CMD_CANCEL, CMD_LANG, CMD_MENU, CMD_RESTART, GREETINGS, WEEKDAYS, WELCOME, t
 from app.models import Conversation, Customer, DeliveryArea, DeliveryDate, MessageLog, Order, Product
-from app.services import delivery, notifications, payments
+from app.services import cancellation, delivery, notifications, payments
 from app.services.catalog import active_products, orderable_products, validate_quantity
 from app.services.core import get_all_settings, get_setting
 from app.services.gateways import GatewayError
 from app.services.messaging import InMessage, Option, OutMessage, send_messages
-from app.services.orders import OrderError, create_order, customer_cancel
-from app.models import AWAITING_PAYMENT
+from app.services.orders import OrderError, create_order
+from app.models import (ACCEPTED, AWAITING_PAYMENT, CANCELLED, DELIVERED, DISPATCHED, PENDING, REJECTED)
 from app.utils import (TELUGU_DIGITS, display_phone, fmt_date, fmt_datetime, money, normalize_indian_mobile, parse_decimal,
                        q2, qty_str, utcnow)
 
@@ -38,6 +38,7 @@ DELIVERY_ADDRESS, LANDMARK = "DELIVERY_ADDRESS", "LANDMARK"
 ORDER_REVIEW, EDIT_SELECTION = "ORDER_REVIEW", "EDIT_SELECTION"
 ORDER_CONFIRMED, HUMAN_SUPPORT = "ORDER_CONFIRMED", "HUMAN_SUPPORT"
 PAYMENT_METHOD, PAYMENT_PENDING = "PAYMENT_METHOD", "PAYMENT_PENDING"
+CANCEL_SELECT, CANCEL_CONFIRM = "CANCEL_SELECT", "CANCEL_CONFIRM"
 
 ORDERING_STATES = {PRODUCT_SELECTION, QUANTITY_SELECTION, QUANTITY_CUSTOM, DELIVERY_DATE_SELECTION,
                    DELIVERY_SLOT_SELECTION, CUSTOMER_NAME, PHONE_CONFIRMATION, PHONE_ENTRY,
@@ -45,8 +46,10 @@ ORDERING_STATES = {PRODUCT_SELECTION, QUANTITY_SELECTION, QUANTITY_CUSTOM, DELIV
                    ORDER_REVIEW, EDIT_SELECTION}
 OPTION_STATES = {LANGUAGE_SELECTION, MAIN_MENU, PRODUCT_SELECTION, QUANTITY_SELECTION,
                  DELIVERY_DATE_SELECTION, DELIVERY_SLOT_SELECTION, PHONE_CONFIRMATION,
-                 VILLAGE_SELECTION, PAYMENT_METHOD, PAYMENT_PENDING, ORDER_REVIEW, EDIT_SELECTION}
-NO_HISTORY = {LANGUAGE_SELECTION, ORDER_CONFIRMED, HUMAN_SUPPORT, PAYMENT_PENDING}
+                 VILLAGE_SELECTION, PAYMENT_METHOD, PAYMENT_PENDING, ORDER_REVIEW, EDIT_SELECTION,
+                 CANCEL_SELECT, CANCEL_CONFIRM}
+NO_HISTORY = {LANGUAGE_SELECTION, ORDER_CONFIRMED, HUMAN_SUPPORT, PAYMENT_PENDING, CANCEL_SELECT, CANCEL_CONFIRM}
+CANCEL_IDS = {"cancel_yes", "cancel_no"}
 DRAFT_KEYS = ["product_id", "qty", "date", "slot_id", "name", "phone", "alt_phone", "area_id",
               "address", "landmark", "draft_id", "editing", "payment_method"]
 STALE = object()
@@ -157,7 +160,7 @@ class Engine:
 
         m = re.fullmatch(r"(?:cancel|రద్దు)\s+(mf-\d{8}-\d{4,})", low)
         if m:
-            return self.cancel_placed_order(ctx, m.group(1).upper())
+            return self.start_cancel_flow(ctx, m.group(1).upper())
 
         if ctx.customer.language is None and state != LANGUAGE_SELECTION:
             ctx.conv.state = LANGUAGE_SELECTION
@@ -184,14 +187,15 @@ class Engine:
                 return self.start_order(ctx)
             if low in CMD_CANCEL:
                 if state == PAYMENT_PENDING:
-                    return self.cancel_payment(ctx)
-                if state in ORDERING_STATES:
+                    return self.start_cancel_flow(ctx, ctx.data.get("last_order"))
+                if state in ORDERING_STATES:  # mid-order: cancels the draft, as before
                     return self.cancel_draft(ctx)
-                self.clear_draft(ctx)
-                return self.goto(ctx, MAIN_MENU, push=False)
+                return self.start_cancel_flow(ctx)  # otherwise: cancel a placed order (asks to confirm)
             if low in CMD_BACK:
                 return self.go_back(ctx)
 
+        if inm.reply_id in CANCEL_IDS and state != CANCEL_CONFIRM:  # old/duplicate button press
+            return [self.txt(ctx, "cancel_stale")] + self.goto(ctx, MAIN_MENU, push=False)
         if state == ORDER_CONFIRMED and inm.reply_id == "confirm_order":
             return [self.txt(ctx, "already_placed", order_id=ctx.data.get("last_order", ""))]
         if state == HUMAN_SUPPORT and not inm.reply_id:
@@ -246,19 +250,93 @@ class Engine:
         self.clear_draft(ctx)
         return [self.txt(ctx, "draft_cancelled")] + self.goto(ctx, MAIN_MENU, push=False)
 
-    def cancel_placed_order(self, ctx, code: str):
-        order = ctx.db.scalar(select(Order).where(Order.order_code == code,
-                                                  Order.customer_id == ctx.customer.id))
+    # ---- customer cancellation of a placed order ------------------------------------
+    ACTIVE = (AWAITING_PAYMENT, PENDING, ACCEPTED, DISPATCHED)
+
+    def contact_phone(self, ctx) -> str:
+        return get_setting(ctx.db, "contact_number") or "-"
+
+    def start_cancel_flow(self, ctx, code: str | None = None):
+        """'cancel' / 'cancel MF-...' : find the order, then ask the customer to confirm."""
+        q = select(Order).where(Order.customer_id == ctx.customer.id)
+        if code:
+            order = ctx.db.scalar(q.where(Order.order_code == code))
+            if order is None:
+                return [self.txt(ctx, "cancel_order_not_found")]
+            if order.status in (CANCELLED, REJECTED):
+                return [self.txt(ctx, "cancel_already", order_id=code)]
+            if order.status == DELIVERED:
+                return [self.txt(ctx, "cancel_delivered", order_id=code, phone=self.contact_phone(ctx))]
+            candidates = [order]
+        else:
+            candidates = list(ctx.db.scalars(q.where(Order.status.in_(self.ACTIVE)).order_by(Order.id.desc()).limit(10)))
+            if not candidates:
+                self.clear_draft(ctx)
+                return [self.txt(ctx, "cancel_none")] + self.goto(ctx, MAIN_MENU, push=False)
+        if len(candidates) == 1:
+            return self.ask_cancel_confirm(ctx, candidates[0])
+        ctx.conv.state = CANCEL_SELECT
+        return self.p_cancel_select(ctx, candidates)
+
+    def p_cancel_select(self, ctx, candidates=None):
+        if candidates is None:
+            candidates = list(ctx.db.scalars(select(Order).where(
+                Order.customer_id == ctx.customer.id, Order.status.in_(self.ACTIVE)).order_by(Order.id.desc()).limit(10)))
+        opts = [Option(f"co_{o.order_code}", o.order_code, f"₹{money(o.total)} · {fmt_date(o.delivery_date)}")
+                for o in candidates]
+        return [OutMessage("list", t("cancel_pick", ctx.lang), opts, button_label=t("choose", ctx.lang))]
+
+    def on_cancel_select(self, ctx, choice, text):
+        code = (choice or "")[3:] if (choice or "").startswith("co_") else None
+        order = ctx.db.scalar(select(Order).where(Order.order_code == code, Order.customer_id == ctx.customer.id)) \
+            if code else None
         if order is None:
-            return [self.txt(ctx, "cancel_order_not_found")]
-        if order.status == AWAITING_PAYMENT:
-            return self.cancel_payment(ctx, order)
-        try:
-            customer_cancel(ctx.db, order)
-        except OrderError:
-            return [self.txt(ctx, "cancel_order_too_late", order_id=code)]
-        notifications.notify_admin_cancelled(ctx.db, order)
-        return [self.txt(ctx, "cancel_order_ok", order_id=code)]
+            return [self.txt(ctx, "unexpected")] + self.p_cancel_select(ctx)
+        return self.ask_cancel_confirm(ctx, order)
+
+    def ask_cancel_confirm(self, ctx, order):
+        if order.status == DISPATCHED:  # cannot be cancelled automatically: record the request, alert the family
+            return self.finish_cancel(ctx, cancellation.customer_cancel_order(ctx.db, order.id))
+        ctx.data["cancel_order"] = order.order_code
+        ctx.conv.state = CANCEL_CONFIRM
+        return self.p_cancel_confirm(ctx)
+
+    def p_cancel_confirm(self, ctx):
+        order = ctx.db.scalar(select(Order).where(Order.order_code == ctx.data.get("cancel_order", "")))
+        if order is None:
+            return self.goto(ctx, MAIN_MENU, push=False)
+        paid = cancellation.paid_amount(order)
+        extra = t("cancel_extra_paid", ctx.lang, amount=money(paid)) if paid else ""
+        opts = [Option("cancel_yes", t("btn_cancel_yes", ctx.lang)), Option("cancel_no", t("btn_cancel_no", ctx.lang))]
+        return [OutMessage("buttons", t("cancel_confirm_q", ctx.lang, order_id=order.order_code,
+                                        total=money(order.total), extra=extra), opts)]
+
+    def on_cancel_confirm(self, ctx, choice, text):
+        order = ctx.db.scalar(select(Order).where(Order.order_code == ctx.data.get("cancel_order", ""),
+                                                  Order.customer_id == ctx.customer.id))
+        if choice == "cancel_no" or order is None:
+            ctx.data.pop("cancel_order", None)
+            msg = [self.txt(ctx, "cancel_kept", order_id=order.order_code)] if order is not None else []
+            return msg + self.goto(ctx, MAIN_MENU, push=False)
+        if choice != "cancel_yes":
+            return [self.txt(ctx, "unexpected")] + self.p_cancel_confirm(ctx)
+        return self.finish_cancel(ctx, cancellation.customer_cancel_order(ctx.db, order.id))
+
+    def finish_cancel(self, ctx, res):
+        """Turn the service outcome into the customer's message (their language), then back to the menu."""
+        code, phone = res.order.order_code, self.contact_phone(ctx)
+        ctx.data.pop("cancel_order", None)
+        self.clear_draft(ctx)
+        if res.outcome == "cancelled" and res.refund_amount:
+            key, kw = "cancel_done_refund", {"amount": money(res.refund_amount)}
+        elif res.outcome == "cancelled":
+            key, kw = ("pay_cancelled" if res.order.payment_method == "ONLINE" else "cancel_done"), {}
+        else:
+            key, kw = {"already_cancelled": "cancel_already", "delivered": "cancel_delivered",
+                       "dispatched_request": "cancel_dispatched", "dispatched_repeat": "cancel_dispatched_again"
+                       }[res.outcome], {}
+        return [OutMessage("text", t(key, ctx.lang, order_id=code, phone=phone, **kw))] + \
+            self.goto(ctx, MAIN_MENU, push=False)
 
     def start_order(self, ctx):
         self.clear_draft(ctx)
@@ -605,14 +683,7 @@ class Engine:
         order = order or ctx.db.scalar(select(Order).where(Order.order_code == ctx.data.get("last_order", "")))
         if order is None:
             return self.goto(ctx, MAIN_MENU, push=False)
-        result = payments.cancel_checkout(ctx.db, order.id)
-        ctx.db.refresh(ctx.conv)
-        if result == "paid":  # the payment had actually gone through; the verifier sent the confirmation
-            ctx.data = copy.deepcopy(ctx.conv.data or {})
-            return []
-        self.clear_draft(ctx)
-        return [OutMessage("text", t("pay_cancelled", ctx.lang, order_id=order.order_code))] + \
-            self.goto(ctx, MAIN_MENU, push=False)
+        return self.finish_cancel(ctx, cancellation.customer_cancel_order(ctx.db, order.id))
 
     def on_order_review(self, ctx, choice, text):
         if choice == "edit_order":
@@ -657,7 +728,8 @@ class Engine:
         if method == "COD":
             if created:
                 notifications.notify_admin_new_order(ctx.db, order)
-            msg = OutMessage("text", notifications.confirmation_text(order))
+            msg = OutMessage("text", t("cod_received", ctx.lang, farm=get_setting(ctx.db, "farm_name"),
+                                       order_id=order.order_code))
             self.clear_draft(ctx)
             ctx.data["last_order"] = order.order_code
             ctx.conv.state = ORDER_CONFIRMED
@@ -669,8 +741,9 @@ class Engine:
         if created or order.payment is None:
             try:
                 payments.start_checkout(ctx.db, order)
-            except (payments.PaymentError, GatewayError):
-                payments.abort_unpaid_order(ctx.db, order, "Could not start online payment")
+            except (payments.PaymentError, GatewayError) as exc:
+                log.error("online payment could not be started for %s: %s", order.order_code, exc)
+                payments.abort_unpaid_order(ctx.db, order, f"Could not start online payment: {str(exc)[:150]}")
                 self.clear_draft(ctx)
                 return [self.txt(ctx, "pay_unavailable")] + self.goto(ctx, MAIN_MENU, push=False)
         ctx.db.refresh(order)

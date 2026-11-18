@@ -10,7 +10,12 @@ from app.utils import display_phone, fmt_date, fmt_datetime, money, qty_str
 
 BASE = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
-templates.env.filters.update(money=money, qty=qty_str, fdate=fmt_date, fdt=fmt_datetime, phone=display_phone)
+STATUS_LABELS = {"PENDING": "Awaiting Confirmation", "ACCEPTED": "Confirmed", "AWAITING_PAYMENT": "Awaiting Payment",
+                 "DISPATCHED": "Dispatched", "DELIVERED": "Delivered", "CANCELLED": "Cancelled", "REJECTED": "Rejected"}
+ACTION_LABELS = {"ACCEPTED": "Confirm Order", "REJECTED": "Reject Order", "CANCELLED": "Cancel Order",
+                 "DISPATCHED": "Mark Dispatched", "DELIVERED": "Mark Delivered"}
+templates.env.filters.update(status_label=lambda s: STATUS_LABELS.get(s, s), action_label=lambda s: ACTION_LABELS.get(s, s),
+                             money=money, qty=qty_str, fdate=fmt_date, fdt=fmt_datetime, phone=display_phone)
 
 
 class NotAuthenticated(Exception):

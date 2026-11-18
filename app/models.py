@@ -171,6 +171,10 @@ class Order(TimestampMixin, Base):
     channel: Mapped[str] = mapped_column(String(12), default="whatsapp")
     reject_reason: Mapped[str | None] = mapped_column(Text)
     cancel_reason: Mapped[str | None] = mapped_column(Text)
+    cancelled_by: Mapped[str | None] = mapped_column(String(10))  # CUSTOMER | ADMIN | SYSTEM
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime)  # customer asked to cancel a dispatched order
+    confirmed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)  # admin verified/confirmed (ACCEPTED)
+    confirmed_by: Mapped[str | None] = mapped_column(String(60))
     customer: Mapped[Customer] = relationship(back_populates="orders")
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
     reservations: Mapped[list["InventoryReservation"]] = relationship(back_populates="order")

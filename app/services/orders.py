@@ -18,7 +18,7 @@ from app.models import (ACCEPTED, AWAITING_PAYMENT, CANCELLED, DELIVERED, DISPAT
                         Product)
 from app.services import delivery
 from app.services.catalog import validate_quantity
-from app.services.core import accepting_orders
+from app.services.core import accepting_orders, audit
 from app.utils import IST, q2, today_ist, utcnow
 
 VALID_TRANSITIONS: dict[str, set[str]] = {
@@ -182,29 +182,49 @@ def _release_reservations(order: Order, db: Session, new_status: str) -> None:
 
 
 def change_status(db: Session, order: Order, new_status: str, reason: str | None = None, *,
-                  commit: bool = True) -> Order:
-    # Re-read the order under a row lock so two simultaneous actions cannot both pass the transition check.
+                 commit: bool = True, actor: str = "system", cancelled_by: str | None = None) -> Order:
+    """Move an order to `new_status` under a row lock, release/commit stock, and write the audit trail.
+
+    actor        who did it: an admin username, "customer:<phone>" or "system" (stored in audit_logs)
+    cancelled_by CUSTOMER | ADMIN | SYSTEM - recorded on the order when it ends up CANCELLED/REJECTED
+    """
+    # Re-read the order under a row lock so two simultaneous actions (e.g. admin and customer)
+    # cannot both pass the transition check; the loser gets invalid_transition.
     db.execute(select(Order.id).where(Order.id == order.id).with_for_update())
     db.refresh(order)
-    if new_status not in VALID_TRANSITIONS.get(order.status, set()):
-        db.rollback() if commit else None
-        raise OrderError("invalid_transition", current=order.status, new=new_status)
+    prev = order.status
+    if new_status not in VALID_TRANSITIONS.get(prev, set()):
+        if commit:
+            db.rollback()
+        raise OrderError("invalid_transition", current=prev, new=new_status)
     if new_status == REJECTED and not (reason or "").strip():
-        db.rollback() if commit else None
+        if commit:
+            db.rollback()
         raise OrderError("reason_required")
     try:
         if new_status in (REJECTED, CANCELLED):
             _release_reservations(order, db, "RELEASED")
+            order.cancelled_by = cancelled_by or ("ADMIN" if not actor.startswith(("system", "customer:")) else
+                                                  "CUSTOMER" if actor.startswith("customer:") else "SYSTEM")
         elif new_status == DELIVERED:
             _release_reservations(order, db, "FULFILLED")
             if order.payment_method == "COD":
                 order.payment_status = "PAID"  # cash collected on delivery
+        elif new_status == ACCEPTED:
+            order.confirmed_at, order.confirmed_by = utcnow(), actor
         if new_status == REJECTED:
             order.reject_reason = reason.strip()
         if new_status == CANCELLED:
             order.cancel_reason = (reason or "").strip() or None
         order.status = new_status
         order.updated_at = utcnow()
+        pay = order.payment
+        pay_info = f"{order.payment_method}/{order.payment_status}" + (
+            f" payment={pay.status}" + (f" refund={pay.refund_id}:{pay.refund_status}" if pay.refund_id else "")
+            if pay else "")
+        audit(db, actor, "order_status", "order", order.order_code,
+              f"{prev} -> {new_status}" + (f" | reason: {reason.strip()}" if (reason or "").strip() else "") +
+              f" | {pay_info}")
         if commit:
             db.commit()
     except Exception:
@@ -233,10 +253,3 @@ def change_delivery_date(db: Session, order: Order, new_date: date, slot_id: int
         db.rollback()
         raise
     return order
-
-
-def customer_cancel(db: Session, order: Order) -> Order:
-    """A customer may cancel only while the order is still PENDING (COD) — paid online orders go through the family."""
-    if order.status != PENDING or order.payment_method != "COD":
-        raise OrderError("too_late")
-    return change_status(db, order, CANCELLED, "Cancelled by customer")

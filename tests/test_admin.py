@@ -70,7 +70,7 @@ def test_password_is_hashed(db):
 
 def test_overview_counts(admin, placed):
     html = admin.get("/admin").text
-    assert "Total orders" in html and "Pending (new)" in html and "Orders today" in html
+    assert "Total orders" in html and "Awaiting Confirmation" in html and "Orders today" in html
 
 
 def test_accept_and_dispatch_notify_customer(admin, db, placed):
@@ -80,7 +80,7 @@ def test_accept_and_dispatch_notify_customer(admin, db, placed):
     db.expire_all()
     assert db.scalar(select(Order.status)) == "DISPATCHED"
     bodies = [m.content["body"] for m in db.scalars(select(MessageLog).where(MessageLog.direction == "OUT"))]
-    assert any("has been accepted" in b for b in bodies) and any("on its way" in b for b in bodies)
+    assert any("confirmed successfully" in b for b in bodies) and any("on its way" in b for b in bodies)
     assert db.scalar(select(AuditLog).where(AuditLog.action == "order_status"))
 
 

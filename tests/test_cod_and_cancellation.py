@@ -268,7 +268,7 @@ def test_cancel_releases_delivery_capacity(db):
 def test_cancel_without_active_order(db):
     chat = Chat(db)
     chat.say("Hi").pick("lang_en").say("cancel")
-    assert "no active order to cancel" in chat.text and len(chat.option_ids) == 5
+    assert "no active order to cancel" in chat.text and len(chat.option_ids) == 3
 
 
 def test_duplicate_cancel_confirmations_are_harmless(db):

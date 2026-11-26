@@ -140,7 +140,8 @@ def first_date_id(chat) -> str:
 
 def drive_to_review(chat: Chat, lang="en", product="prod_1", qty="qty_2", slot=False, pay="cod"):
     """Full happy path up to the order summary. pay='cod' enables COD for the customer first
-    (as the family would); pay='online' leaves COD off, the default."""
+    (as the family would); pay='online' leaves COD off, the default.
+    First-time customers type their name and one address message; returning customers tap 'Deliver here'."""
     if pay == "cod":
         allow_cod(chat.db, chat.phone)
     chat.say("Hi").pick("lang_te" if lang == "te" else "lang_en")
@@ -148,9 +149,14 @@ def drive_to_review(chat: Chat, lang="en", product="prod_1", qty="qty_2", slot=F
     chat.pick(first_date_id(chat))
     if slot:
         chat.pick(next(i for i in chat.option_ids if i.startswith("slot_")))
-    chat.say("Ravi Kumar").pick("phone_yes").pick("skip")
-    chat.pick(next(i for i in chat.option_ids if i.startswith("area_")))
-    chat.say("H.No 4-5, Main Road").pick("skip")
+    if "use_saved" in chat.option_ids:
+        chat.pick("use_saved")
+    else:
+        chat.say("Ravi Kumar")
+        area = next((i for i in chat.option_ids if i.startswith("area_")), None)
+        if area:  # only asked when more than one village is served
+            chat.pick(area)
+        chat.say("H.No 4-5, Main Road, near the temple")
     if "pay_cod" in chat.option_ids:
         chat.pick("pay_cod" if pay == "cod" else "pay_online")
     return chat

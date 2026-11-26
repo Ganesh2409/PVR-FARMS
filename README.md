@@ -5,7 +5,7 @@ Customers order and pay on WhatsApp (no app, no account); the family manages pro
 
 **Stack:** Python 3.12+, FastAPI, SQLAlchemy 2 + psycopg 3, Alembic, **PostgreSQL**, Jinja2, **Cashfree Payments**, Meta WhatsApp Cloud API.
 
-> **Status:** works end-to-end with the development mock gateway and is tested against PostgreSQL 16 (177 automated tests).
+> **Status:** works end-to-end with the development mock gateway and is tested against PostgreSQL 16 (201 automated tests).
 > **Not yet verified:** the real Cashfree Sandbox, real WhatsApp, Docker, and a second computer — see [Untested](#untested--not-production-ready).
 
 * New computer? → **[docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)** (complete step-by-step).
@@ -77,6 +77,22 @@ WhatsApp/Simulator ─► conversation engine ─► create_order (stock + date 
 * **Cash on Delivery is off by default.** It is offered only when the global switch (Admin → Settings) **and** the per-customer flag (Admin → Customers → customer) are both on.
 * **Secrets:** `CASHFREE_CLIENT_SECRET` lives only in the server environment and request headers; the pay page contains only the (non-secret) `payment_session_id`.
 * **Development mock:** `PAYMENT_PROVIDER=mock` gives a fake gateway with *Simulate success / failure / expiry* buttons on the pay page. The server refuses to start with it in production.
+
+## The ordering conversation (what the customer sees)
+
+Designed to take as few taps as possible, with every screen kept inside WhatsApp's own limits (3 reply buttons of 20 characters, list rows of 24, bodies of 1024; a test checks every screen in both languages).
+
+| Step | What the customer sees |
+|---|---|
+| Start | Language choice (first time only), then **three buttons**: 🛒 Order Now · 💰 Prices · ⋯ More (Contact us, Change language). Returning customers are greeted by name. |
+| **1/5** Mangoes | One **photo card per variety**: photo, name, description, ₹ price per kg, stock, and its own **🛒 Order this** button (a variety can also be typed). Out-of-stock varieties are shown but cannot be ordered. |
+| **2/5** Quantity | Up to three buttons **with the price on each** (`2 kg · ₹120`), or just **type the kg** (`3`, `2.5`). |
+| **3/5** Delivery | Dates as `Tomorrow · 27-11-2026`, `Sat · 28-11-2026`, with "Only 3 left" when a day is nearly full; time slot if the farm uses them. The quantity total (`✅ 3 kg × ₹60 = ₹180`) is part of this message. |
+| **4/5** Details | **New customer:** name, then **one address message** including a landmark. The WhatsApp number is used automatically and the village is picked automatically when only one is served. **Returning customer:** one tap on **✅ Deliver here** (name, phone, address come from their last order) or **✏️ Change**. |
+| **5/5** Check | **One card** (variety, kg × price, delivery, total, date, name/phone/address, payment) with the buttons ✅ Confirm & Pay · ✏️ Edit Details · ❌ Cancel Order attached. *Edit* lists: variety, quantity, date, name, address, phone, alternative phone (and village when more than one is served). |
+| Payment | A single message with a real **Pay ₹210** button (WhatsApp "CTA URL" button, shown as plain text with the link on non-HTTPS dev setups), validity time and "Send 'cancel' to cancel this order". |
+
+A new customer now needs **9 messages from "Hi" to a placed order (was 14); a returning customer needs 7**. Product photos come from Admin → Products (text cards are used until a photo is uploaded). Alternative phone and a separate landmark question were removed from the main path (the landmark is part of the address; the alternative phone is under *Edit Details*).
 
 ## Cash on Delivery verification and customer cancellation
 

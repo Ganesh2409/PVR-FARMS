@@ -26,12 +26,15 @@ class Option:
 
 @dataclass
 class OutMessage:
-    kind: str  # text | buttons | list | image
+    kind: str  # text | buttons | list | image | cta
     body: str
     options: list[Option] = field(default_factory=list)
-    image_url: str | None = None
+    image_url: str | None = None  # kind "image": the picture itself
     button_label: str = "Select"
     footer: str = ""
+    header_image: str | None = None  # picture shown on top of a "buttons" / "cta" message (photo cards)
+    cta_text: str = ""  # kind "cta": label of the single link button, e.g. "Pay ₹150"
+    cta_url: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -71,8 +74,14 @@ def build_payload(to: str, msg: OutMessage) -> dict:
     opts = msg.options
     if msg.kind == "image" and msg.image_url:
         return {**base, "type": "image", "image": {"link": msg.image_url, "caption": msg.body[:1024]}}
-    if msg.kind == "buttons" and 0 < len(opts) <= 3:
-        inter = {"type": "button", "body": {"text": msg.body[:1024]},
+    header = {"header": {"type": "image", "image": {"link": msg.header_image}}} if msg.header_image else {}
+    if msg.kind == "cta":
+        if not msg.cta_url.startswith("https://"):  # WhatsApp only accepts https links: fall back to plain text
+            return {**base, "type": "text", "text": {"preview_url": True, "body": f"{msg.body}\n\n{msg.cta_url}"[:4096]}}
+        inter = {"type": "cta_url", **header, "body": {"text": msg.body[:1024]},
+                 "action": {"name": "cta_url", "parameters": {"display_text": msg.cta_text[:20], "url": msg.cta_url}}}
+    elif msg.kind == "buttons" and 0 < len(opts) <= 3:
+        inter = {"type": "button", **header, "body": {"text": msg.body[:1024]},
                  "action": {"buttons": [{"type": "reply", "reply": {"id": o.id[:256], "title": o.title[:20]}}
                                         for o in opts]}}
     elif msg.kind in ("buttons", "list") and opts:

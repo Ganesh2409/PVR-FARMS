@@ -97,3 +97,35 @@ On the other computer follow `docs/WINDOWS_SETUP.md` steps 1–7 (mock provider,
 
 ### Exact next step
 Read `docs/DEPLOY_CHANGES_TO_RAILWAY.md`, copy the listed files into your repo, run `python -m pytest -q` against `mango_farm_test`, then tell me to proceed (or what differs) before anything is pushed or deployed.
+
+
+---
+
+## Session 4 - friendlier WhatsApp ordering experience
+
+### Why
+Testing on real WhatsApp felt tedious and badly arranged: ~14 customer messages / ~16 bot messages per order, repeat customers retyped everything, long text-wall summaries, raw payment URL, a 5-item menu list, a two-step "custom quantity".
+
+### Decisions (confirmed with the family)
+Remember returning customers' details with one-tap reuse; trim to essentials (name + one address message, WhatsApp number automatic, village automatic when only one); photo cards with an Order button.
+
+### Changes
+* `conversation.py`: new flow (see README "The ordering conversation"); states `SAVED_DETAILS` added; `QUANTITY_CUSTOM`, `PHONE_CONFIRMATION`, `LANDMARK` and the separate alternative-phone step are no longer on the main path (legacy handlers kept so in-flight chats still work); typed kg in the quantity step; typed variety names; every option shown in one turn stays tappable (several product cards).
+* `messaging.py`: `OutMessage` gains `header_image` (photo on top of a button message) and the `cta` kind -> WhatsApp `interactive.type = cta_url` (falls back to text for non-HTTPS links).
+* `i18n.py`: ~35 strings rewritten/added (EN + TE): step counters 1/5-5/5, emoji structure, shorter wording; button titles verified <= 20 characters.
+* Simulator renders photo headers, the Pay button, and numbers options as typed shortcuts.
+* `pytest.ini` pins `testpaths = tests`.
+
+### Tests executed
+`python -m pytest -q` on PostgreSQL 16.4 (throwaway server, non-superuser role, test database only): **201 passed** = 177 earlier (updated for the new flow; every behavioural assertion kept) + 24 new in `tests/test_ux_flow.py` (message counts, saved details, village auto/ask, photo cards, out-of-stock, typed variety, priced quantity buttons, typed kg, date labels, one-message summary incl. very long address, Pay button payload, **WhatsApp length limits over full EN and TE journeys**). The limits test caught a real defect before release: the payment-method button "Pay online (UPI/card)" was 21 characters (WhatsApp maximum 20), also in Telugu; now shortened.
+Visually checked in the browser simulator (English and Telugu): menu, photo cards, quantity buttons, dates, summary card, Pay button.
+
+### Known limitations / not verified
+* **Not tried on real WhatsApp yet.** Photo headers on button messages and the `cta_url` button follow Meta's documented Cloud API format, but have only been verified through our payload builder and the simulator. Photos need a public HTTPS `PUBLIC_BASE_URL`.
+* Saved details come from the customer's most recent order (any status). A customer who only ever had a rejected order still gets the saved-address shortcut.
+* The payment message no longer has a Cancel button (WhatsApp allows only one button type per message); customers send `cancel` and the footer says so.
+* Meta's 24-hour rule still applies to messages sent later (needs the approved template).
+* WhatsApp "Flows" (a proper address form) were considered and left for later: they need extra Meta setup.
+
+### Exact next step
+Try the new flow on your real WhatsApp number after deploying (or in the simulator), tell me what still feels off, and we iterate.

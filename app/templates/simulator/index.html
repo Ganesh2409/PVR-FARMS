@@ -13,13 +13,14 @@ header button{background:#25d366;border:0;border-radius:6px;padding:.3rem .6rem;
 .opts{display:flex;flex-direction:column;gap:.3rem;margin-top:.5rem}
 .opts button{background:#fff;color:#0a7cff;border:1px solid #cfe3ff;border-radius:8px;padding:.45rem;cursor:pointer;font:inherit;text-align:left}
 .opts button small{display:block;color:#667;font-size:.78rem}.opts button:disabled{color:#999;border-color:#eee;cursor:default;background:#fafafa}
+.cta{display:block;text-align:center;margin-top:.5rem;padding:.55rem;border-radius:8px;background:#fff;border:1px solid #cfe3ff;color:#0a7cff;text-decoration:none;font-weight:600}
 .err{color:#c0392b;font-size:.8rem}.tag{font-size:.7rem;color:#888;margin-top:.2rem}
 form{display:flex;gap:.4rem;padding:.5rem;background:#f0f0f0}form input{flex:1;padding:.6rem;border-radius:20px;border:1px solid #ccc;font:inherit}
 form button{background:#075e54;color:#fff;border:0;border-radius:50%;width:42px;cursor:pointer;font-size:1.1rem}
 .note{font-size:.72rem;text-align:center;color:#666;padding:.2rem;background:#fff8dc}
 </style></head><body><div class="phone">
 <header><b>🥭 Mango Farm</b><input id="phone" value="919000000001" inputmode="numeric" aria-label="Customer phone"><button id="reset">Reset</button></header>
-<div class="note">Local simulator — same engine as real WhatsApp. Say "Hi" to start. Replies like 1, 2, 3 also work.</div>
+<div class="note">Local simulator — same engine as real WhatsApp. Say "Hi" to start. You can tap buttons or type the number shown.</div>
 <div id="chat"></div>
 <form id="f"><input id="text" autocomplete="off" placeholder="Type a message (Hi / నమస్కారం)…"><button aria-label="Send">➤</button></form>
 </div>
@@ -30,16 +31,18 @@ const fmt=s=>esc(s).replace(/\*([^*\n]+)\*/g,'<b>$1</b>');
 const phone=()=>$('phone').value.replace(/\D/g,'');
 async function api(url,body){const r=await fetch(url,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});
  if(!r.ok){const e=await r.text();throw new Error(r.status+' '+e.slice(0,120));}return r.json();}
-function render(msgs){const chat=$('chat');if(!msgs.length)return;
+function render(msgs){const chat=$('chat');if(!msgs.length)return;let num=0;
  chat.querySelectorAll('.opts button').forEach(b=>b.disabled=true);
- for(const m of msgs){const d=document.createElement('div');d.className='m '+(m.direction==='IN'?'in':'out');const c=m.content||{};
+ for(const m of msgs){if(m.direction==='IN')num=0;const d=document.createElement('div');d.className='m '+(m.direction==='IN'?'in':'out');const c=m.content||{};
   if(m.direction==='IN'){d.innerHTML=fmt(c.text||c.reply_id||'');}
   else{let h='';if(c.kind==='image'&&c.image_url)h+=`<img src="${esc(c.image_url)}" alt="">`;
+   if(c.header_image)h+=`<img src="${esc(c.header_image)}" alt="" onerror="this.remove()">`;
    h+=fmt(c.body||'');if(c.kind==='template')h+='<div class="tag">📨 sent as approved template (outside 24h window)</div>';
    if(m.status==='failed')h+='<div class="err">Delivery failed</div>';d.innerHTML=h;
    if((c.options||[]).length){const o=document.createElement('div');o.className='opts';
-    c.options.forEach((op,i)=>{const b=document.createElement('button');b.innerHTML=`${i+1}. ${esc(op.title)}`+(op.desc?`<small>${esc(op.desc)}</small>`:'');
+    c.options.forEach((op,i)=>{const b=document.createElement('button');b.innerHTML=`${++num}. ${esc(op.title)}`+(op.desc?`<small>${esc(op.desc)}</small>`:'');
      b.onclick=()=>send(op.title,op.id);o.appendChild(b);});d.appendChild(o);}
+   if(c.kind==='cta'&&c.cta_url){const a=document.createElement('a');a.className='cta';a.href=c.cta_url;a.target='_blank';a.rel='noopener';a.textContent='🔗 '+c.cta_text;d.appendChild(a);}
    if(c.footer){const f=document.createElement('div');f.className='tag';f.textContent=c.footer;d.appendChild(f);}}
   chat.appendChild(d);}chat.scrollTop=chat.scrollHeight;}
 async function send(text,reply_id){if(busy)return;busy=true;try{const r=await api('/simulator/api/send',{phone:phone(),text,reply_id:reply_id||null,after:last});last=r.last_id;render(r.messages);}catch(e){alert(e.message)}busy=false;}

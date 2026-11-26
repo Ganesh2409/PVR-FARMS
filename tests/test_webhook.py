@@ -91,23 +91,21 @@ def test_interactive_replies_and_full_order_over_webhook(client, db, monkeypatch
     mid = lambda: f"wamid.F{next(n)}"
     post(client, text_event(mid(), "Hi"))
     post(client, reply_event(mid(), "lang_en"))
-    post(client, reply_event(mid(), "menu_order", kind="list_reply"))
-    post(client, reply_event(mid(), "prod_1", kind="list_reply"))
+    post(client, reply_event(mid(), "menu_order"))
+    post(client, reply_event(mid(), "prod_1"))  # tapped the "Order this" button on a product card
     post(client, reply_event(mid(), "qty_2"))
-    dates = [r["id"] for r in sent[-1]["interactive"]["action"]["sections"][0]["rows"]]
-    assert dates and all(len(r["title"]) <= 24 for r in sent[-1]["interactive"]["action"]["sections"][0]["rows"])
-    post(client, reply_event(mid(), dates[0], kind="list_reply"))
+    rows = sent[-1]["interactive"]["action"]["sections"][0]["rows"]
+    assert rows and all(len(r["title"]) <= 24 for r in rows) and rows[0]["title"].startswith("Tomorrow")
+    post(client, reply_event(mid(), rows[0]["id"], kind="list_reply"))
     post(client, text_event(mid(), "Ravi Kumar"))
-    post(client, reply_event(mid(), "phone_yes"))
-    post(client, reply_event(mid(), "skip"))
-    post(client, reply_event(mid(), "area_1", kind="list_reply"))
-    post(client, text_event(mid(), "1-2-3 Main Road"))
-    post(client, reply_event(mid(), "skip"))
+    post(client, text_event(mid(), "1-2-3 Main Road, near the temple"))
     post(client, reply_event(mid(), "confirm_order"))
     db.expire_all()
     o = db.scalar(select(Order))
     assert o and o.channel == "whatsapp" and o.contact_phone == PHONE
-    assert any(o.order_code in m.get("text", {}).get("body", "") for m in sent[-3:])  # payment link message
+    cta = sent[-1]["interactive"]  # the payment link is a real WhatsApp "Pay" button
+    assert cta["type"] == "cta_url" and cta["action"]["parameters"]["display_text"] == "Pay ₹150"
+    assert cta["action"]["parameters"]["url"].startswith("https://shop.test/pay/") and o.order_code in cta["body"]["text"]
 
 
 def test_unsupported_type_gets_polite_reply(client, db, monkeypatch):

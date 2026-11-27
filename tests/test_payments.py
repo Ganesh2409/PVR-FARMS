@@ -79,7 +79,8 @@ def test_cod_is_off_by_default_and_online_checkout_is_created(db):
     assert pay.status == "PENDING" and pay.provider_order_id == order.order_code
     assert pay.payment_session_id.startswith("mock_session_") and pay.cf_order_id
     assert pay.amount == order.total == Decimal("150.00")
-    assert f"https://shop.test/pay/{pay.checkout_token}" in chat.text
+    cta = next(m for m in chat.last if m.kind == "cta")  # a real "Pay ₹150" button, not a raw link in text
+    assert cta.cta_url == f"https://shop.test/pay/{pay.checkout_token}" and cta.cta_text == "Pay ₹150"
     assert len(pay.checkout_token) >= 40  # unguessable
     assert pay.expires_at > utcnow() + timedelta(minutes=25)
     assert "Your order has been successfully placed" not in chat.text  # NOT confirmed yet
@@ -113,7 +114,7 @@ def test_cod_flow_still_works_when_allowed(db):
     assert "Cash on Delivery" in chat.last[0].body and "Confirm Order" in " ".join(o.title for m in chat.last for o in m.options)
     chat.pick("confirm_order")
     o = db.scalar(select(Order))
-    assert o.status == PENDING and o.payment_method == "COD" and "Payment Method: Cash on Delivery." in chat.text
+    assert o.status == PENDING and o.payment_method == "COD" and "waiting for confirmation" in chat.text
     assert db.scalar(select(func.count(Payment.id))) == 0
 
 
@@ -159,7 +160,7 @@ def test_success_message_in_telugu(db, client):
     chat = Chat(db)
     drive_to_review(chat, lang="te", pay="online").pick("confirm_order")
     order = db.scalar(select(Order))
-    assert "చెల్లించడానికి ఈ సురక్షిత లింక్" in chat.text
+    assert "కింద బటన్ నొక్కి" in chat.text and chat.last[-1].cta_text == "₹150 చెల్లించండి"
     MockGateway.simulate(order.order_code, "success")
     send_webhook(client, cf_event(order.order_code))
     assert any("మీ ఆర్డర్ విజయవంతంగా నమోదు చేయబడింది!" in b and "ఆన్‌లైన్ (చెల్లించబడింది" in b for b in out_bodies(db))
@@ -322,7 +323,7 @@ def test_gateway_down_at_checkout_leaves_nothing_stuck(db):
     o = db.scalar(select(Order))
     assert o.status == CANCELLED and reserved(db) == 0
     assert db.scalar(select(Payment.status)) == "FAILED"
-    assert len(chat.option_ids) == 5  # back at the main menu
+    assert len(chat.option_ids) == 3  # back at the main menu
 
 
 def test_missing_public_url_cannot_start_checkout(db, monkeypatch):
@@ -391,7 +392,7 @@ def test_sweeper_does_not_expire_a_payment_that_actually_succeeded(db):
 
 def test_customer_cancels_unpaid_order(db):
     chat, order = place_online(db)
-    chat.pick("cancel_payment")
+    chat.say("cancel").pick("cancel_yes")
     reload(db)
     assert db.get(Order, order.id).status == CANCELLED and reserved(db) == 0
     assert db.scalar(select(Payment.status)) == "EXPIRED" and db.scalar(select(Payment.closed_reason)) == "CANCELLED"
@@ -401,26 +402,33 @@ def test_customer_cancels_unpaid_order(db):
 def test_customer_cancel_by_text_command(db):
     chat, order = place_online(db)
     chat.say("cancel")
+    assert "Do you want to cancel order" in chat.text
+    chat.pick("cancel_yes")
     reload(db)
     assert db.get(Order, order.id).status == CANCELLED
     chat.say(f"cancel {order.order_code}")  # already cancelled: harmless
+    assert "already cancelled" in chat.text
     reload(db)
     assert db.get(Order, order.id).status == CANCELLED
 
 
 def test_cancel_never_discards_a_payment_that_just_succeeded(db):
+    """Paid a moment before the customer cancelled: the money is verified and REFUNDED, never lost."""
     chat, order = place_online(db)
     MockGateway.simulate(order.order_code, "success")  # paid, webhook not yet processed
-    chat.pick("cancel_payment")
+    chat.say("cancel").pick("cancel_yes")
     reload(db)
-    assert db.get(Order, order.id).status == PENDING and db.scalar(select(Payment.status)) == "SUCCESS"
-    assert any("successfully placed" in b for b in out_bodies(db))
+    p = db.scalar(select(Payment))
+    assert db.get(Order, order.id).status == CANCELLED and reserved(db) == 0
+    assert p.cf_payment_id == "mockpay1" and p.refund_id == f"RF-{order.order_code}" and p.status == "REFUNDED"
+    assert "refunding the ₹150" in chat.text
 
 
 def test_payment_pending_chat_reports_status_instead_of_trusting_claims(db):
     chat, order = place_online(db)
     chat.say("paid!!")
-    assert "waiting for payment" in chat.text and payment_of(db, order).checkout_token in chat.text
+    cta = chat.last[0]
+    assert cta.kind == "cta" and cta.cta_url.endswith(payment_of(db, order).checkout_token)
     reload(db)
     assert db.get(Order, order.id).status == AWAITING_PAYMENT
 

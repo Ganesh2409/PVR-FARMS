@@ -17,13 +17,13 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.i18n import CMD_BACK, CMD_CANCEL, CMD_LANG, CMD_MENU, CMD_RESTART, GREETINGS, WEEKDAYS, WELCOME, t
 from app.models import Conversation, Customer, DeliveryArea, DeliveryDate, MessageLog, Order, Product
-from app.services import delivery, notifications, payments
+from app.services import cancellation, delivery, notifications, payments
 from app.services.catalog import active_products, orderable_products, validate_quantity
 from app.services.core import get_all_settings, get_setting
 from app.services.gateways import GatewayError
 from app.services.messaging import InMessage, Option, OutMessage, send_messages
-from app.services.orders import OrderError, create_order, customer_cancel
-from app.models import AWAITING_PAYMENT
+from app.services.orders import OrderError, create_order
+from app.models import (ACCEPTED, AWAITING_PAYMENT, CANCELLED, DELIVERED, DISPATCHED, PENDING, REJECTED)
 from app.utils import (TELUGU_DIGITS, display_phone, fmt_date, fmt_datetime, money, normalize_indian_mobile, parse_decimal,
                        q2, qty_str, utcnow)
 
@@ -38,15 +38,20 @@ DELIVERY_ADDRESS, LANDMARK = "DELIVERY_ADDRESS", "LANDMARK"
 ORDER_REVIEW, EDIT_SELECTION = "ORDER_REVIEW", "EDIT_SELECTION"
 ORDER_CONFIRMED, HUMAN_SUPPORT = "ORDER_CONFIRMED", "HUMAN_SUPPORT"
 PAYMENT_METHOD, PAYMENT_PENDING = "PAYMENT_METHOD", "PAYMENT_PENDING"
+CANCEL_SELECT, CANCEL_CONFIRM = "CANCEL_SELECT", "CANCEL_CONFIRM"
+SAVED_DETAILS = "SAVED_DETAILS"
 
 ORDERING_STATES = {PRODUCT_SELECTION, QUANTITY_SELECTION, QUANTITY_CUSTOM, DELIVERY_DATE_SELECTION,
                    DELIVERY_SLOT_SELECTION, CUSTOMER_NAME, PHONE_CONFIRMATION, PHONE_ENTRY,
                    ALTERNATIVE_PHONE, VILLAGE_SELECTION, DELIVERY_ADDRESS, LANDMARK, PAYMENT_METHOD,
-                   ORDER_REVIEW, EDIT_SELECTION}
+                   ORDER_REVIEW, EDIT_SELECTION, SAVED_DETAILS}
 OPTION_STATES = {LANGUAGE_SELECTION, MAIN_MENU, PRODUCT_SELECTION, QUANTITY_SELECTION,
                  DELIVERY_DATE_SELECTION, DELIVERY_SLOT_SELECTION, PHONE_CONFIRMATION,
-                 VILLAGE_SELECTION, PAYMENT_METHOD, PAYMENT_PENDING, ORDER_REVIEW, EDIT_SELECTION}
-NO_HISTORY = {LANGUAGE_SELECTION, ORDER_CONFIRMED, HUMAN_SUPPORT, PAYMENT_PENDING}
+                 VILLAGE_SELECTION, PAYMENT_METHOD, PAYMENT_PENDING, ORDER_REVIEW, EDIT_SELECTION,
+                 CANCEL_SELECT, CANCEL_CONFIRM, SAVED_DETAILS}
+NUMERIC_INPUT_STATES = {QUANTITY_SELECTION}  # typing a number here means "kg", not "option #"
+NO_HISTORY = {LANGUAGE_SELECTION, ORDER_CONFIRMED, HUMAN_SUPPORT, PAYMENT_PENDING, CANCEL_SELECT, CANCEL_CONFIRM}
+CANCEL_IDS = {"cancel_yes", "cancel_no"}
 DRAFT_KEYS = ["product_id", "qty", "date", "slot_id", "name", "phone", "alt_phone", "area_id",
               "address", "landmark", "draft_id", "editing", "payment_method"]
 STALE = object()
@@ -112,8 +117,13 @@ def handle_incoming(db: Session, inm: InMessage, channel: str) -> list[OutMessag
 
 
 def _finish(ctx: Ctx, out: list[OutMessage]) -> None:
-    last = next((m for m in reversed(out) if m.options), None)
-    ctx.data["last_options"] = [[o.id, o.title] for o in last.options] if last else []
+    seen, opts = set(), []
+    for m in out:  # every tappable option shown this turn (e.g. several product cards)
+        for o in m.options:
+            if o.id not in seen:
+                seen.add(o.id)
+                opts.append([o.id, o.title])
+    ctx.data["last_options"] = opts
     ctx.conv.data = ctx.data
     ctx.db.commit()
 
@@ -125,7 +135,7 @@ class Engine:
         return OutMessage("text", t(key, ctx.lang, **kw))
 
     def free_text(self, ctx, body: str) -> OutMessage:
-        return OutMessage("text", f"{body}\n\n{t('hint', ctx.lang)}")
+        return OutMessage("text", body)
 
     def clear_draft(self, ctx):
         for k in DRAFT_KEYS:
@@ -157,7 +167,7 @@ class Engine:
 
         m = re.fullmatch(r"(?:cancel|రద్దు)\s+(mf-\d{8}-\d{4,})", low)
         if m:
-            return self.cancel_placed_order(ctx, m.group(1).upper())
+            return self.start_cancel_flow(ctx, m.group(1).upper())
 
         if ctx.customer.language is None and state != LANGUAGE_SELECTION:
             ctx.conv.state = LANGUAGE_SELECTION
@@ -184,14 +194,15 @@ class Engine:
                 return self.start_order(ctx)
             if low in CMD_CANCEL:
                 if state == PAYMENT_PENDING:
-                    return self.cancel_payment(ctx)
-                if state in ORDERING_STATES:
+                    return self.start_cancel_flow(ctx, ctx.data.get("last_order"))
+                if state in ORDERING_STATES:  # mid-order: cancels the draft, as before
                     return self.cancel_draft(ctx)
-                self.clear_draft(ctx)
-                return self.goto(ctx, MAIN_MENU, push=False)
+                return self.start_cancel_flow(ctx)  # otherwise: cancel a placed order (asks to confirm)
             if low in CMD_BACK:
                 return self.go_back(ctx)
 
+        if inm.reply_id in CANCEL_IDS and state != CANCEL_CONFIRM:  # old/duplicate button press
+            return [self.txt(ctx, "cancel_stale")] + self.goto(ctx, MAIN_MENU, push=False)
         if state == ORDER_CONFIRMED and inm.reply_id == "confirm_order":
             return [self.txt(ctx, "already_placed", order_id=ctx.data.get("last_order", ""))]
         if state == HUMAN_SUPPORT and not inm.reply_id:
@@ -210,7 +221,8 @@ class Engine:
         if inm.reply_id:
             return inm.reply_id if inm.reply_id in ids else STALE
         digits = low.translate(TELUGU_DIGITS)
-        if ctx.state in OPTION_STATES and digits.isdigit() and 1 <= int(digits) <= len(ids):
+        if (ctx.state in OPTION_STATES and ctx.state not in NUMERIC_INPUT_STATES and digits.isdigit()
+                and 1 <= int(digits) <= len(ids)):
             return ids[int(digits) - 1]
         for oid, title in last:
             if _norm(title) == low:
@@ -246,19 +258,93 @@ class Engine:
         self.clear_draft(ctx)
         return [self.txt(ctx, "draft_cancelled")] + self.goto(ctx, MAIN_MENU, push=False)
 
-    def cancel_placed_order(self, ctx, code: str):
-        order = ctx.db.scalar(select(Order).where(Order.order_code == code,
-                                                  Order.customer_id == ctx.customer.id))
+    # ---- customer cancellation of a placed order ------------------------------------
+    ACTIVE = (AWAITING_PAYMENT, PENDING, ACCEPTED, DISPATCHED)
+
+    def contact_phone(self, ctx) -> str:
+        return get_setting(ctx.db, "contact_number") or "-"
+
+    def start_cancel_flow(self, ctx, code: str | None = None):
+        """'cancel' / 'cancel MF-...' : find the order, then ask the customer to confirm."""
+        q = select(Order).where(Order.customer_id == ctx.customer.id)
+        if code:
+            order = ctx.db.scalar(q.where(Order.order_code == code))
+            if order is None:
+                return [self.txt(ctx, "cancel_order_not_found")]
+            if order.status in (CANCELLED, REJECTED):
+                return [self.txt(ctx, "cancel_already", order_id=code)]
+            if order.status == DELIVERED:
+                return [self.txt(ctx, "cancel_delivered", order_id=code, phone=self.contact_phone(ctx))]
+            candidates = [order]
+        else:
+            candidates = list(ctx.db.scalars(q.where(Order.status.in_(self.ACTIVE)).order_by(Order.id.desc()).limit(10)))
+            if not candidates:
+                self.clear_draft(ctx)
+                return [self.txt(ctx, "cancel_none")] + self.goto(ctx, MAIN_MENU, push=False)
+        if len(candidates) == 1:
+            return self.ask_cancel_confirm(ctx, candidates[0])
+        ctx.conv.state = CANCEL_SELECT
+        return self.p_cancel_select(ctx, candidates)
+
+    def p_cancel_select(self, ctx, candidates=None):
+        if candidates is None:
+            candidates = list(ctx.db.scalars(select(Order).where(
+                Order.customer_id == ctx.customer.id, Order.status.in_(self.ACTIVE)).order_by(Order.id.desc()).limit(10)))
+        opts = [Option(f"co_{o.order_code}", o.order_code, f"₹{money(o.total)} · {fmt_date(o.delivery_date)}")
+                for o in candidates]
+        return [OutMessage("list", t("cancel_pick", ctx.lang), opts, button_label=t("choose", ctx.lang))]
+
+    def on_cancel_select(self, ctx, choice, text):
+        code = (choice or "")[3:] if (choice or "").startswith("co_") else None
+        order = ctx.db.scalar(select(Order).where(Order.order_code == code, Order.customer_id == ctx.customer.id)) \
+            if code else None
         if order is None:
-            return [self.txt(ctx, "cancel_order_not_found")]
-        if order.status == AWAITING_PAYMENT:
-            return self.cancel_payment(ctx, order)
-        try:
-            customer_cancel(ctx.db, order)
-        except OrderError:
-            return [self.txt(ctx, "cancel_order_too_late", order_id=code)]
-        notifications.notify_admin_cancelled(ctx.db, order)
-        return [self.txt(ctx, "cancel_order_ok", order_id=code)]
+            return [self.txt(ctx, "unexpected")] + self.p_cancel_select(ctx)
+        return self.ask_cancel_confirm(ctx, order)
+
+    def ask_cancel_confirm(self, ctx, order):
+        if order.status == DISPATCHED:  # cannot be cancelled automatically: record the request, alert the family
+            return self.finish_cancel(ctx, cancellation.customer_cancel_order(ctx.db, order.id))
+        ctx.data["cancel_order"] = order.order_code
+        ctx.conv.state = CANCEL_CONFIRM
+        return self.p_cancel_confirm(ctx)
+
+    def p_cancel_confirm(self, ctx):
+        order = ctx.db.scalar(select(Order).where(Order.order_code == ctx.data.get("cancel_order", "")))
+        if order is None:
+            return self.goto(ctx, MAIN_MENU, push=False)
+        paid = cancellation.paid_amount(order)
+        extra = t("cancel_extra_paid", ctx.lang, amount=money(paid)) if paid else ""
+        opts = [Option("cancel_yes", t("btn_cancel_yes", ctx.lang)), Option("cancel_no", t("btn_cancel_no", ctx.lang))]
+        return [OutMessage("buttons", t("cancel_confirm_q", ctx.lang, order_id=order.order_code,
+                                        total=money(order.total), extra=extra), opts)]
+
+    def on_cancel_confirm(self, ctx, choice, text):
+        order = ctx.db.scalar(select(Order).where(Order.order_code == ctx.data.get("cancel_order", ""),
+                                                  Order.customer_id == ctx.customer.id))
+        if choice == "cancel_no" or order is None:
+            ctx.data.pop("cancel_order", None)
+            msg = [self.txt(ctx, "cancel_kept", order_id=order.order_code)] if order is not None else []
+            return msg + self.goto(ctx, MAIN_MENU, push=False)
+        if choice != "cancel_yes":
+            return [self.txt(ctx, "unexpected")] + self.p_cancel_confirm(ctx)
+        return self.finish_cancel(ctx, cancellation.customer_cancel_order(ctx.db, order.id))
+
+    def finish_cancel(self, ctx, res):
+        """Turn the service outcome into the customer's message (their language), then back to the menu."""
+        code, phone = res.order.order_code, self.contact_phone(ctx)
+        ctx.data.pop("cancel_order", None)
+        self.clear_draft(ctx)
+        if res.outcome == "cancelled" and res.refund_amount:
+            key, kw = "cancel_done_refund", {"amount": money(res.refund_amount)}
+        elif res.outcome == "cancelled":
+            key, kw = ("pay_cancelled" if res.order.payment_method == "ONLINE" else "cancel_done"), {}
+        else:
+            key, kw = {"already_cancelled": "cancel_already", "delivered": "cancel_delivered",
+                       "dispatched_request": "cancel_dispatched", "dispatched_repeat": "cancel_dispatched_again"
+                       }[res.outcome], {}
+        return [OutMessage("text", t(key, ctx.lang, order_id=code, phone=phone, **kw))] + \
+            self.goto(ctx, MAIN_MENU, push=False)
 
     def start_order(self, ctx):
         self.clear_draft(ctx)
@@ -276,18 +362,37 @@ class Engine:
 
     def p_main_menu(self, ctx):
         ctx.conv.state = MAIN_MENU
-        opts = [Option(k, t(k, ctx.lang)) for k in
-                ("menu_varieties", "menu_order", "menu_prices", "menu_contact", "menu_language")]
-        return [OutMessage("list", t("menu_title", ctx.lang), opts, button_label=t("choose", ctx.lang))]
+        name = (ctx.customer.name or "").split(" ")[0]
+        title = t("menu_title_named", ctx.lang, name=name) if name else t("menu_title", ctx.lang)
+        opts = [Option("menu_order", t("btn_order_now", ctx.lang)), Option("menu_prices", t("btn_prices", ctx.lang)),
+                Option("menu_more", t("btn_more", ctx.lang))]
+        return [OutMessage("buttons", title, opts)]
+
+    def p_more_menu(self, ctx):
+        opts = [Option("menu_contact", t("menu_contact", ctx.lang)), Option("menu_language", t("menu_language", ctx.lang))]
+        return [OutMessage("list", t("more_title", ctx.lang), opts, button_label=t("choose", ctx.lang))]
+
+    def product_card(self, ctx, p, orderable: bool) -> OutMessage:
+        av = p.available_qty
+        stock = t("stock_kg", ctx.lang, qty=qty_str(av)) if av > 0 else t("out_of_stock", ctx.lang)
+        body = t("product_card", ctx.lang, name=p.name(ctx.lang), desc=p.description(ctx.lang),
+                 price=money(p.price_per_kg), stock=stock)
+        url = media_url(ctx.customer, p.image_path)
+        if not orderable:
+            return OutMessage("image", body, image_url=url) if url else OutMessage("text", body)
+        return OutMessage("buttons", body, [Option(f"prod_{p.id}", t("btn_order_this", ctx.lang))], header_image=url)
 
     def p_product_selection(self, ctx):
-        products = orderable_products(ctx.db)
-        if not products:
+        products = active_products(ctx.db)
+        orderable = {p.id for p in orderable_products(ctx.db)}
+        if not orderable:
             ctx.conv.state = MAIN_MENU
             return [self.txt(ctx, "no_products")] + self.p_main_menu(ctx)
-        opts = [Option(f"prod_{p.id}", p.name(ctx.lang), f"₹{money(p.price_per_kg)} / kg") for p in products]
-        return [OutMessage("list", t("choose_product", ctx.lang), opts, button_label=t("choose", ctx.lang),
-                           footer=t("hint", ctx.lang)[:60])]
+        if len(products) <= 4:  # photo cards, each with its own "Order this" button
+            return [self.txt(ctx, "choose_product")] + [self.product_card(ctx, p, p.id in orderable) for p in products]
+        opts = [Option(f"prod_{p.id}", p.name(ctx.lang), f"₹{money(p.price_per_kg)} / kg")
+                for p in products if p.id in orderable]
+        return [OutMessage("list", t("choose_product", ctx.lang), opts, button_label=t("choose", ctx.lang))]
 
     def _product(self, ctx):
         return ctx.db.get(Product, ctx.data["product_id"]) if ctx.data.get("product_id") else None
@@ -295,17 +400,12 @@ class Engine:
     def p_quantity_selection(self, ctx):
         p = self._product(ctx)
         opts = []
-        for q, key in ((1, "qty_1"), (2, "qty_2"), (5, "qty_5")):
-            if validate_quantity(p, Decimal(q)) is None:
-                opts.append(Option(f"qty_{q}", t(key, ctx.lang)))
-        opts.append(Option("qty_custom", t("qty_custom", ctx.lang)))
-        return [OutMessage("buttons" if len(opts) <= 3 else "list",
-                           t("ask_quantity", ctx.lang, name=p.name(ctx.lang), price=money(p.price_per_kg)),
-                           opts, button_label=t("choose", ctx.lang), footer=t("hint", ctx.lang)[:60])]
-
-    def p_quantity_custom(self, ctx):
-        p = self._product(ctx)
-        return [self.free_text(ctx, t("ask_custom_qty", ctx.lang, min=qty_str(p.min_qty)))]
+        for q in (1, 2, 5, 10):
+            if len(opts) < 3 and validate_quantity(p, Decimal(q)) is None:
+                opts.append(Option(f"qty_{q}", t("qty_opt", ctx.lang, q=q, p=money(Decimal(q) * Decimal(p.price_per_kg)))))
+        body = t("ask_quantity", ctx.lang, name=p.name(ctx.lang), price=money(p.price_per_kg))
+        return [OutMessage("buttons", body, opts, header_image=media_url(ctx.customer, p.image_path))] if opts else \
+            [OutMessage("text", body)]
 
     def p_delivery_date_selection(self, ctx):
         dates = delivery.available_dates(ctx.db, limit=9)
@@ -313,12 +413,18 @@ class Engine:
             self.clear_draft(ctx)
             ctx.conv.state = MAIN_MENU
             return [self.txt(ctx, "no_dates")] + self.p_main_menu(ctx)
-        opts = [Option(f"date_{o.row.date.isoformat()}", self.date_label(ctx, o.row.date)) for o in dates]
-        return [OutMessage("list", t("ask_date", ctx.lang), opts, button_label=t("choose", ctx.lang),
-                           footer=t("hint", ctx.lang)[:60])]
+        opts = [Option(f"date_{o.row.date.isoformat()}", self.date_label(ctx, o.row.date),
+                       t("left_few", ctx.lang, n=o.remaining) if o.remaining <= 5 else "") for o in dates]
+        note = ctx.data.pop("_note", "")
+        body = (note + "\n\n" if note else "") + t("ask_date", ctx.lang)
+        return [OutMessage("list", body, opts, button_label=t("choose", ctx.lang))]
 
     def date_label(self, ctx, d: date) -> str:
-        return f"{fmt_date(d)} ({WEEKDAYS[ctx.lang][d.weekday()]})"
+        from app.utils import today_ist
+        delta = (d - today_ist()).days
+        word = t("day_today", ctx.lang) if delta == 0 else t("day_tomorrow", ctx.lang) if delta == 1 \
+            else WEEKDAYS[ctx.lang][d.weekday()]
+        return f"{word} · {fmt_date(d)}"
 
     def p_delivery_slot_selection(self, ctx):
         dd = ctx.db.scalar(select(DeliveryDate).where(DeliveryDate.date == date.fromisoformat(ctx.data["date"])))
@@ -330,7 +436,7 @@ class Engine:
     def p_customer_name(self, ctx):
         return [self.free_text(ctx, t("ask_name", ctx.lang))]
 
-    def p_phone_confirmation(self, ctx):
+    def p_phone_confirmation(self, ctx):  # legacy state, kept so old chats still work
         opts = [Option("phone_yes", t("yes_use", ctx.lang)), Option("phone_other", t("other_number", ctx.lang))]
         return [OutMessage("buttons", t("confirm_phone", ctx.lang, phone=display_phone(ctx.customer.whatsapp_number)),
                            opts)]
@@ -349,10 +455,59 @@ class Engine:
         return [OutMessage("list", t("ask_village", ctx.lang), opts, button_label=t("choose", ctx.lang))]
 
     def p_delivery_address(self, ctx):
-        return [self.free_text(ctx, t("ask_address", ctx.lang))]
+        return [self.free_text(ctx, t("ask_address", ctx.lang, name=(ctx.data.get("name") or "").split(" ")[0]))]
 
-    def p_landmark(self, ctx):
+    def p_landmark(self, ctx):  # legacy state
         return [OutMessage("buttons", t("ask_landmark", ctx.lang), [Option("skip", t("skip", ctx.lang))])]
+
+    # -- saved details (returning customers): taken from their most recent order
+    def saved_details(self, ctx) -> dict | None:
+        o = ctx.db.scalar(select(Order).where(Order.customer_id == ctx.customer.id).order_by(Order.id.desc()).limit(1))
+        if o is None or o.area_id is None:
+            return None
+        area = ctx.db.get(DeliveryArea, o.area_id)
+        if area is None or not area.is_active:
+            return None
+        return {"name": o.customer_name, "phone": o.contact_phone, "alt_phone": o.alt_phone, "area_id": o.area_id,
+                "address": o.address, "landmark": o.landmark}
+
+    def p_saved_details(self, ctx):
+        sd = self.saved_details(ctx)
+        if sd is None:
+            return self.goto(ctx, CUSTOMER_NAME, push=False)
+        area = ctx.db.get(DeliveryArea, sd["area_id"])
+        addr = sd["address"] + (f", {sd['landmark']}" if sd["landmark"] else "") + f", {area.name(ctx.lang)}"
+        opts = [Option("use_saved", t("btn_deliver_here", ctx.lang)), Option("change_saved", t("btn_change", ctx.lang))]
+        return [OutMessage("buttons", t("saved_details", ctx.lang, name=sd["name"], phone=display_phone(sd["phone"]),
+                                        address=addr), opts)]
+
+    def on_saved_details(self, ctx, choice, text):
+        if choice == "use_saved":
+            sd = self.saved_details(ctx)
+            if sd is None:
+                return self.goto(ctx, CUSTOMER_NAME)
+            ctx.data.update(sd)
+            return self.details_done(ctx)
+        if choice == "change_saved":
+            return self.goto(ctx, CUSTOMER_NAME)
+        return [self.txt(ctx, "unexpected")] + self.prompt(ctx, SAVED_DETAILS)
+
+    def next_details(self, ctx):
+        """After date/slot: one tap for returning customers, otherwise ask the name."""
+        if ctx.data.pop("editing", None):
+            return self.goto(ctx, ORDER_REVIEW)
+        if self.saved_details(ctx) is not None:
+            return self.goto(ctx, SAVED_DETAILS)
+        return self.goto(ctx, CUSTOMER_NAME)
+
+    def details_done(self, ctx):
+        """Delivery details complete: choose payment (only if COD is possible) or review."""
+        if ctx.data.pop("editing", None):
+            return self.goto(ctx, ORDER_REVIEW)
+        if self.cod_available(ctx):
+            return self.goto(ctx, PAYMENT_METHOD)
+        ctx.data.setdefault("payment_method", "ONLINE")
+        return self.goto(ctx, ORDER_REVIEW)
 
     def cod_available(self, ctx) -> bool:
         return get_setting(ctx.db, "cod_enabled").lower() == "true" and bool(ctx.customer.cod_allowed)
@@ -365,10 +520,15 @@ class Engine:
         order = ctx.db.scalar(select(Order).where(Order.order_code == ctx.data.get("last_order", "")))
         if order is None or order.payment is None:
             return self.goto(ctx, MAIN_MENU, push=False)
+        return [self.pay_cta(ctx, order)]
+
+    def pay_cta(self, ctx, order) -> OutMessage:
+        """The payment link as a real "Pay ₹150" button (not a raw URL in a wall of text)."""
         p = order.payment
-        opts = [Option("cancel_payment", t("btn_cancel_payment", ctx.lang)), Option("to_menu", t("btn_menu", ctx.lang))]
-        return [OutMessage("buttons", t("pay_pending_status", ctx.lang, order_id=order.order_code,
-                                        url=payments.pay_url(p), expiry=fmt_datetime(p.expires_at)), opts)]
+        return OutMessage("cta", t("pay_cta", ctx.lang, order_id=order.order_code, total=money(order.total),
+                                   expiry=fmt_datetime(p.expires_at)),
+                          cta_text=t("pay_cta_btn", ctx.lang, total=money(order.total)), cta_url=payments.pay_url(p),
+                          footer=t("pay_cta_footer", ctx.lang))
 
     def p_order_review(self, ctx):
         d = ctx.data
@@ -376,27 +536,32 @@ class Engine:
         qty = Decimal(str(d["qty"]))
         sub = q2(qty * Decimal(p.price_per_kg))
         charge = q2(area.delivery_charge)
-        slot = t("any_time", ctx.lang)
+        slot_part = ""
         if d.get("slot_id"):
             from app.models import DeliverySlot
-            slot = ctx.db.get(DeliverySlot, d["slot_id"]).name(ctx.lang)
+            slot_part = " · " + ctx.db.get(DeliverySlot, d["slot_id"]).name(ctx.lang)
         address = d["address"] + (f", {d['landmark']}" if d.get("landmark") else "") + f", {area.name(ctx.lang)}"
+        method = d.get("payment_method", "ONLINE")
         body = t("review_body", ctx.lang, name=d["name"], phone=display_phone(d["phone"]),
                  product=p.name(ctx.lang), qty=qty_str(qty), price=money(p.price_per_kg), subtotal=money(sub),
-                 delivery=money(charge), total=money(sub + charge), address=address,
-                 date=fmt_date(date.fromisoformat(d["date"])), slot=slot)
-        method = d.get("payment_method", "ONLINE")
-        body = body.replace("💵 చెల్లింపు: Cash on Delivery", "💵 చెల్లింపు: " + t("review_pay_" + method.lower(), "te")) \
-                   .replace("💵 Payment: Cash on Delivery", "💵 Payment: " + t("review_pay_" + method.lower(), "en"))
+                 delivery=money(charge), total=money(sub + charge), address=address[:220],
+                 date=fmt_date(date.fromisoformat(d["date"])), slot_part=slot_part,
+                 payment=t("review_pay_" + method.lower(), ctx.lang))
+        if d.get("alt_phone"):
+            body += f"\n📞 {display_phone(d['alt_phone'])}"
         confirm_label = t("btn_confirm_pay" if method == "ONLINE" else "btn_confirm", ctx.lang)
         opts = [Option("confirm_order", confirm_label), Option("edit_order", t("btn_edit", ctx.lang)),
                 Option("cancel_order", t("btn_cancel", ctx.lang))]
-        return [OutMessage("text", f"{t('review_title', ctx.lang)}\n\n{body}"),
-                OutMessage("buttons", t("confirm_q", ctx.lang), opts)]
+        question = t("confirm_q", ctx.lang)
+        if len(body) + len(question) + 2 <= 1000:  # fits one WhatsApp message: card + buttons together
+            return [OutMessage("buttons", f"{body}\n\n{question}", opts)]
+        return [OutMessage("text", body), OutMessage("buttons", question, opts)]
 
     def p_edit_selection(self, ctx):
-        keys = ["edit_product", "edit_qty", "edit_date", "edit_name", "edit_phone", "edit_village",
-                "edit_address", "edit_landmark", "edit_back"]
+        keys = ["edit_product", "edit_qty", "edit_date", "edit_name", "edit_address", "edit_phone", "edit_alt"]
+        if len(delivery.active_areas(ctx.db)) > 1:
+            keys.append("edit_village")
+        keys.append("edit_back")
         return [OutMessage("list", t("edit_q", ctx.lang), [Option(k, t(k, ctx.lang)) for k in keys],
                            button_label=t("choose", ctx.lang))]
 
@@ -418,12 +583,12 @@ class Engine:
         return self.goto(ctx, MAIN_MENU, push=False)
 
     def on_main_menu(self, ctx, choice, text):
-        if choice == "menu_order":
+        if choice in ("menu_order", "menu_varieties"):  # varieties are browsed on the ordering cards
             return self.start_order(ctx)
-        if choice == "menu_varieties":
-            return self.show_varieties(ctx)
         if choice == "menu_prices":
             return self.show_prices(ctx)
+        if choice == "menu_more":
+            return self.p_more_menu(ctx)
         if choice == "menu_contact":
             return self.show_contact(ctx)
         if choice == "menu_language":
@@ -465,7 +630,12 @@ class Engine:
 
     def on_product_selection(self, ctx, choice, text):
         if not (choice or "").startswith("prod_"):
-            return [self.txt(ctx, "unexpected")] + self.prompt(ctx, PRODUCT_SELECTION)
+            low = _norm(text)
+            match = next((p for p in active_products(ctx.db) if low and (low == _norm(p.name_en) or low == _norm(p.name_te)
+                                                                           or low in _norm(p.name_en))), None)
+            if match is None:
+                return [self.txt(ctx, "unexpected")] + self.prompt(ctx, PRODUCT_SELECTION)
+            choice = f"prod_{match.id}"
         p = ctx.db.get(Product, int(choice[5:]))
         if p is None or not p.is_active:
             return [self.txt(ctx, "err_product")] + self.prompt(ctx, PRODUCT_SELECTION)
@@ -484,16 +654,19 @@ class Engine:
             kw = {k: qty_str(v) for k, v in c.items()}
             return [self.txt(ctx, key, **kw)] + self.prompt(ctx, ctx.state)
         ctx.data["qty"] = str(qty)
+        if ctx.data.get("editing"):
+            return self.after_field(ctx, DELIVERY_DATE_SELECTION)
         sub = q2(qty * Decimal(p.price_per_kg))
-        note = self.txt(ctx, "qty_ok", qty=qty_str(qty), price=money(p.price_per_kg), sub=money(sub))
-        return [note] + self.after_field(ctx, DELIVERY_DATE_SELECTION)
+        ctx.data["_note"] = t("qty_ok", ctx.lang, qty=qty_str(qty), price=money(p.price_per_kg), sub=money(sub))
+        return self.goto(ctx, DELIVERY_DATE_SELECTION)
 
     def on_quantity_selection(self, ctx, choice, text):
-        if choice == "qty_custom":
-            return self.goto(ctx, QUANTITY_CUSTOM)
-        if choice in ("qty_1", "qty_2", "qty_5"):
+        if choice and choice.startswith("qty_") and choice[4:].isdigit():
             return self.accept_quantity(ctx, Decimal(choice[4:]))
-        return [self.txt(ctx, "unexpected")] + self.prompt(ctx, QUANTITY_SELECTION)
+        qty = parse_decimal(text)  # any typed number is a quantity in kg (also covers the old "custom" button)
+        if qty is None:
+            return [self.txt(ctx, "qty_invalid")] + self.prompt(ctx, QUANTITY_SELECTION)
+        return self.accept_quantity(ctx, qty)
 
     def on_quantity_custom(self, ctx, choice, text):
         qty = parse_decimal(text)
@@ -512,7 +685,7 @@ class Engine:
         ctx.data.pop("slot_id", None)
         if delivery.slots_for_date(ctx.db, dd):
             return self.goto(ctx, DELIVERY_SLOT_SELECTION)
-        return self.after_field(ctx, CUSTOMER_NAME)
+        return self.next_details(ctx)
 
     def on_delivery_slot_selection(self, ctx, choice, text):
         if not (choice or "").startswith("slot_"):
@@ -522,14 +695,24 @@ class Engine:
         if slot is None:
             return [self.txt(ctx, "err_slot")] + self.prompt(ctx, DELIVERY_SLOT_SELECTION)
         ctx.data["slot_id"] = slot.id
-        return self.after_field(ctx, CUSTOMER_NAME)
+        return self.next_details(ctx)
 
     def on_customer_name(self, ctx, choice, text):
         name = " ".join(text.split())
         if len(name) < 2 or len(name) > 80 or name.isdigit():
             return [self.txt(ctx, "name_invalid")]
         ctx.data["name"] = name
-        return self.after_field(ctx, PHONE_CONFIRMATION)
+        ctx.data.setdefault("phone", ctx.customer.whatsapp_number)  # the WhatsApp number; editable on the summary
+        ctx.data.setdefault("alt_phone", None)
+        if ctx.data.get("editing"):
+            return self.goto(ctx, ORDER_REVIEW) if ctx.data.pop("editing", None) else []
+        areas = delivery.active_areas(ctx.db)
+        if not areas:
+            return [self.txt(ctx, "err_area")] + self.goto(ctx, MAIN_MENU, push=False)
+        if len(areas) == 1:  # only one village is served: no question needed
+            ctx.data["area_id"] = areas[0].id
+            return self.goto(ctx, DELIVERY_ADDRESS)
+        return self.goto(ctx, VILLAGE_SELECTION)
 
     def on_phone_confirmation(self, ctx, choice, text):
         if choice == "phone_yes":
@@ -554,7 +737,7 @@ class Engine:
             if not phone:
                 return [self.txt(ctx, "phone_invalid")] + self.prompt(ctx, ALTERNATIVE_PHONE)
             ctx.data["alt_phone"] = phone
-        return self.goto(ctx, VILLAGE_SELECTION)
+        return self.after_field(ctx, VILLAGE_SELECTION)
 
     def on_village_selection(self, ctx, choice, text):
         if not (choice or "").startswith("area_"):
@@ -570,7 +753,8 @@ class Engine:
         if len(addr) < 8:
             return [self.txt(ctx, "address_short")]
         ctx.data["address"] = addr[:300]
-        return self.after_field(ctx, LANDMARK)
+        ctx.data["landmark"] = None  # the landmark is part of the single address message now
+        return self.details_done(ctx)
 
     def on_landmark(self, ctx, choice, text):
         ctx.data["landmark"] = None if choice == "skip" else " ".join(text.split())[:150] or None
@@ -605,14 +789,7 @@ class Engine:
         order = order or ctx.db.scalar(select(Order).where(Order.order_code == ctx.data.get("last_order", "")))
         if order is None:
             return self.goto(ctx, MAIN_MENU, push=False)
-        result = payments.cancel_checkout(ctx.db, order.id)
-        ctx.db.refresh(ctx.conv)
-        if result == "paid":  # the payment had actually gone through; the verifier sent the confirmation
-            ctx.data = copy.deepcopy(ctx.conv.data or {})
-            return []
-        self.clear_draft(ctx)
-        return [OutMessage("text", t("pay_cancelled", ctx.lang, order_id=order.order_code))] + \
-            self.goto(ctx, MAIN_MENU, push=False)
+        return self.finish_cancel(ctx, cancellation.customer_cancel_order(ctx.db, order.id))
 
     def on_order_review(self, ctx, choice, text):
         if choice == "edit_order":
@@ -626,7 +803,8 @@ class Engine:
     EDIT_TARGETS = {"edit_product": PRODUCT_SELECTION, "edit_qty": QUANTITY_SELECTION,
                     "edit_date": DELIVERY_DATE_SELECTION, "edit_name": CUSTOMER_NAME,
                     "edit_phone": PHONE_ENTRY, "edit_village": VILLAGE_SELECTION,
-                    "edit_address": DELIVERY_ADDRESS, "edit_landmark": LANDMARK}
+                    "edit_address": DELIVERY_ADDRESS, "edit_landmark": LANDMARK,
+                    "edit_alt": ALTERNATIVE_PHONE}
 
     def on_edit_selection(self, ctx, choice, text):
         if choice == "edit_back":
@@ -657,7 +835,8 @@ class Engine:
         if method == "COD":
             if created:
                 notifications.notify_admin_new_order(ctx.db, order)
-            msg = OutMessage("text", notifications.confirmation_text(order))
+            msg = OutMessage("text", t("cod_received", ctx.lang, farm=get_setting(ctx.db, "farm_name"),
+                                       order_id=order.order_code))
             self.clear_draft(ctx)
             ctx.data["last_order"] = order.order_code
             ctx.conv.state = ORDER_CONFIRMED
@@ -669,8 +848,9 @@ class Engine:
         if created or order.payment is None:
             try:
                 payments.start_checkout(ctx.db, order)
-            except (payments.PaymentError, GatewayError):
-                payments.abort_unpaid_order(ctx.db, order, "Could not start online payment")
+            except (payments.PaymentError, GatewayError) as exc:
+                log.error("online payment could not be started for %s: %s", order.order_code, exc)
+                payments.abort_unpaid_order(ctx.db, order, f"Could not start online payment: {str(exc)[:150]}")
                 self.clear_draft(ctx)
                 return [self.txt(ctx, "pay_unavailable")] + self.goto(ctx, MAIN_MENU, push=False)
         ctx.db.refresh(order)
@@ -678,10 +858,7 @@ class Engine:
         self.clear_draft(ctx)
         ctx.data["last_order"] = order.order_code
         ctx.conv.state = PAYMENT_PENDING
-        opts = [Option("cancel_payment", t("btn_cancel_payment", ctx.lang)), Option("to_menu", t("btn_menu", ctx.lang))]
-        return [OutMessage("text", t("pay_link", ctx.lang, order_id=order.order_code, total=money(order.total),
-                                     url=payments.pay_url(p), expiry=fmt_datetime(p.expires_at))),
-                OutMessage("buttons", t("btn_cancel_payment", ctx.lang) + "?", opts)]
+        return [self.pay_cta(ctx, order)]
 
     def confirm_failed(self, ctx, e: OrderError):
         ctx.data["editing"] = True

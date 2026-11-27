@@ -16,7 +16,8 @@ def notify_customer(db: Session, order: Order, event: str, reason: str | None = 
     """event is an order status (ACCEPTED, REJECTED, ...) or DATE_CHANGED."""
     lang = order.language
     text = t(f"n_{event}", lang, name=order.customer_name, order_id=order.order_code,
-             date=fmt_date(order.delivery_date), reason=reason or order.reject_reason or order.cancel_reason or "")
+             date=fmt_date(order.delivery_date), reason=reason or order.reject_reason or order.cancel_reason or "",
+             farm=get_setting(db, "farm_name"))
     if event == "CANCELLED" and not reason:
         text = text.strip()
     customer = order.customer
@@ -51,7 +52,9 @@ def _admin_text(db: Session, text: str) -> None:
 
 def notify_admin_new_order(db: Session, order: Order) -> None:
     item = order.items[0]
-    text = (f"🥭 New order {order.order_code}\n{order.customer_name} ({order.contact_phone})\n"
+    kind = ("CASH ON DELIVERY - please CALL the customer to verify, then confirm in the dashboard"
+            if order.payment_method == "COD" else "PAID online - please confirm in the dashboard")
+    text = (f"🥭 New order {order.order_code}: {kind}\n{order.customer_name} ({order.contact_phone})\n"
             f"{item.product_name_en} x {item.quantity.normalize():f} kg = ₹{money(order.total)}\n"
             f"Delivery {fmt_date(order.delivery_date)} - {order.village_name}")
     try:
@@ -67,6 +70,21 @@ def notify_admin_cancelled(db: Session, order: Order) -> None:
     except Exception:
         log.exception("admin notification failed")
         db.rollback()
+
+
+def notify_admin_customer_cancelled(db: Session, order: Order, prev_status: str, refund_amount=None) -> None:
+    refund = f" Refund of ₹{money(refund_amount)} requested - check the Refunds view." if refund_amount else ""
+    notify_admin_text(db, f"Customer cancelled order {order.order_code} (it was {prev_status}).{refund}")
+
+
+def notify_admin_cancel_request(db: Session, order: Order) -> None:
+    notify_admin_text(db, f"⚠️ {order.customer_name} ({order.contact_phone}) asks to CANCEL order "
+                          f"{order.order_code}, which is already DISPATCHED. Please call them and decide in the dashboard.")
+
+
+def notify_refund_started(db: Session, order_id: int) -> None:
+    order = db.get(Order, order_id)
+    _send(db, order, t("pay_refund_started", order.language, order_id=order.order_code, amount=money(order.total)))
 
 
 def notify_admin_text(db: Session, text: str) -> None:

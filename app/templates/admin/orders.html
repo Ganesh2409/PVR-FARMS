@@ -1,18 +1,42 @@
 {% extends "admin/base.html" %}{% block title %}Orders{% endblock %}
 {% block content %}
 <h1>Orders</h1>
-<p>{% for v, l in [('','All'),('new','New'),('awaiting','Awaiting payment'),('pending_delivery','Pending deliveries'),('completed','Completed'),('cancelled','Cancelled / rejected')] %}
+<p>{% for v, l in [('','All'),('new','Awaiting Confirmation'),('confirmed','Confirmed'),('dispatched','Dispatched'),('delivered','Delivered'),('cancelled','Cancelled / Rejected'),('awaiting','Awaiting Payment'),('refund_pending','Refunds pending'),('refunded','Refunded'),('cancel_requests','Cancel requests')] %}
 <a class="btn sm {{ '' if view == v else 'ghost' }}" href="/admin/orders?view={{ v }}">{{ l }}</a> {% endfor %}</p>
 <form method="get" class="card inline"><input type="hidden" name="view" value="{{ view }}">
 <div><label>Search order ID / phone / name</label><input name="q" value="{{ q }}"></div>
-<div><label>Status</label><select name="status"><option value="">Any</option>{% for s in statuses %}<option {{ 'selected' if s == status }}>{{ s }}</option>{% endfor %}</select></div>
+<div><label>Status</label><select name="status"><option value="">Any</option>{% for s in statuses %}<option value="{{ s }}" {{ 'selected' if s == status }}>{{ s|status_label }}</option>{% endfor %}</select></div>
 <div><label>Delivery from</label><input type="date" name="date_from" value="{{ date_from }}"></div>
 <div><label>Delivery to</label><input type="date" name="date_to" value="{{ date_to }}"></div>
 <button class="btn">Filter</button>
 <a class="btn ghost" href="/admin/orders/export.csv?q={{ q|urlencode }}&status={{ status }}&date_from={{ date_from }}&date_to={{ date_to }}&view={{ view }}">Export CSV</a></form>
+
+{% if view == 'new' %}
+<p class="muted" style="margin-top:1rem">Call each customer to verify the details, then press <b>Confirm Order</b>. If you cannot reach them, leave the order here or reject it with a reason.</p>
+{% for o in orders %}
+<div class="card" style="margin-top:.8rem;border-left:5px solid var(--yellow)">
+<div><b><a href="/admin/orders/{{ o.id }}">{{ o.order_code }}</a></b> · {{ o.payment_method }}{% if o.payment_method == 'ONLINE' %} (paid){% endif %} · placed {{ o.created_at|fdt }}</div>
+<dl class="kv" style="margin-top:.5rem">
+<dt>Customer</dt><dd>{{ o.customer_name }} · <b>{{ o.contact_phone|phone }}</b>{% if o.alt_phone %} / {{ o.alt_phone|phone }}{% endif %}</dd>
+<dt>Address</dt><dd>{{ o.address }}{% if o.landmark %}, near {{ o.landmark }}{% endif %}, {{ o.village_name }}</dd>
+<dt>Order</dt><dd>{% for i in o.items %}{{ i.product_name_en }} — {{ i.quantity|qty }} kg{% endfor %}</dd>
+<dt>Total</dt><dd><b>₹{{ o.total|money }}</b></dd>
+<dt>Delivery</dt><dd>{{ o.delivery_date|fdate }} {{ o.slot_name or '' }}</dd></dl>
+<div class="inline" style="margin-top:.7rem">
+<form method="post" action="/admin/orders/{{ o.id }}/status" style="flex:0"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="new_status" value="ACCEPTED"><button class="btn">Confirm Order</button></form>
+<form method="post" action="/admin/orders/{{ o.id }}/status" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="new_status" value="REJECTED">
+<div><input name="reason" required maxlength="300" placeholder="Reason (e.g. could not reach customer)"></div><button class="btn danger">Reject</button></form>
+<a class="btn ghost" href="/admin/orders/{{ o.id }}" style="flex:0">View Details</a></div>
+</div>
+{% else %}<div class="card muted" style="margin-top:.8rem">Nothing is waiting for confirmation. 🎉</div>{% endfor %}
+
+{% else %}
 <div class="tablewrap" style="margin-top:1rem"><table><tr><th>Order ID</th><th>Customer</th><th>Phone</th><th>Product</th><th>Qty</th><th>Amount</th><th>Payment</th><th>Delivery</th><th>Status</th></tr>
 {% for o in orders %}<tr><td><a href="/admin/orders/{{ o.id }}">{{ o.order_code }}</a></td><td>{{ o.customer_name }}</td><td>{{ o.contact_phone|phone }}</td>
-<td>{{ o.items[0].product_name_en if o.items }}</td><td>{{ o.items[0].quantity|qty if o.items }} kg</td><td>₹{{ o.total|money }}</td><td>{{ o.payment_method }}<br><span class="muted">{{ o.payment_status }}</span></td><td>{{ o.delivery_date|fdate }}{% if o.slot_name %}<br><span class="muted">{{ o.slot_name }}</span>{% endif %}</td>
-<td><span class="badge b-{{ o.status }}">{{ o.status }}</span></td></tr>
+<td>{{ o.items[0].product_name_en if o.items }}</td><td>{{ o.items[0].quantity|qty if o.items }} kg</td><td>₹{{ o.total|money }}</td>
+<td>{{ o.payment_method }}<br><span class="muted">{{ o.payment_status }}{% if o.payment and o.payment.refund_status %} · refund {{ o.payment.refund_status }}{% endif %}</span></td>
+<td>{{ o.delivery_date|fdate }}{% if o.slot_name %}<br><span class="muted">{{ o.slot_name }}</span>{% endif %}</td>
+<td><span class="badge b-{{ o.status }}">{{ o.status|status_label }}</span>{% if o.cancel_requested_at and o.status == 'DISPATCHED' %}<br><span class="badge b-CANCELLED">cancel requested</span>{% endif %}</td></tr>
 {% else %}<tr><td colspan="9" class="muted">No orders match.</td></tr>{% endfor %}</table></div>
+{% endif %}
 {% endblock %}

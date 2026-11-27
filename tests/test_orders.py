@@ -141,7 +141,7 @@ def test_customer_notification_logged_and_localised(db):
     assert notifications.notify_customer(db, o, "ACCEPTED") == "sent"
     from app.models import MessageLog
     log = db.scalar(select(MessageLog).where(MessageLog.direction == "OUT"))
-    assert o.order_code in log.content["body"] and "accepted" in log.content["body"]
+    assert o.order_code in log.content["body"] and "confirmed successfully" in log.content["body"]
 
 
 def test_notification_outside_24h_window_uses_template(db, monkeypatch):

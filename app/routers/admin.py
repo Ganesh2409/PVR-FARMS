@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.config import get_settings
 from app.database import get_db
 from app.models import (ACCEPTED, ACTIVE_STATUSES, ALL_STATUSES, AWAITING_PAYMENT, CANCELLED, DELIVERED, DISPATCHED, PENDING, REJECTED,
-                        AdminUser, AuditLog, Customer, DeliveryArea, DeliveryDate, DeliverySlot, Order, Product)
+                        AdminUser, AuditLog, Customer, DeliveryArea, DeliveryDate, DeliverySlot, Order, Payment, Product)
 from app.security import (client_ip, csrf_token, hash_password, login_limiter, verify_csrf, verify_password)
 from app.services import catalog, delivery, notifications, payments
 from app.services.core import DEFAULT_SETTINGS, audit, get_all_settings, set_setting
@@ -28,6 +28,7 @@ Csrf = Depends(verify_csrf)
 ERRORS = {
     "invalid_transition": "That status change is not allowed from the current status.",
     "reason_required": "Please give a reason for rejecting the order.",
+    "paid_meanwhile": "The customer has just paid for this order, so it was not cancelled. Re-open it and cancel again if you want to refund.",
     "date_unavailable": "That delivery date is not available (inactive, past, or full).",
     "slot_unavailable": "Please choose a valid delivery slot for that date.",
 }
@@ -142,6 +143,10 @@ def overview(request: Request, db: Session = Depends(get_db), admin: AdminUser =
     stats = {
         "total": sum(counts.values()), "pending": counts.get(PENDING, 0), "accepted": counts.get(ACCEPTED, 0),
         "awaiting": counts.get(AWAITING_PAYMENT, 0),
+        "refunds_pending": db.scalar(select(func.count(Payment.id)).join(Order, Order.id == Payment.order_id).where(
+            Payment.status == "SUCCESS", Order.status.in_([CANCELLED, REJECTED]))) or 0,
+        "cancel_requests": db.scalar(select(func.count(Order.id)).where(
+            Order.status == DISPATCHED, Order.cancel_requested_at.is_not(None))) or 0,
         "delivered": counts.get(DELIVERED, 0), "cancelled": counts.get(CANCELLED, 0) + counts.get(REJECTED, 0),
         "sales": total_sales, "today": orders_today,
         "pending_deliveries": counts.get(ACCEPTED, 0) + counts.get(DISPATCHED, 0)}
@@ -228,16 +233,29 @@ def product_toggle(pid: int, request: Request, db: Session = Depends(get_db), ad
 # ------------------------------------------------------------------ orders
 def _order_query(q: str, status: str, date_from: str, date_to: str, view: str):
     stmt = select(Order).options(selectinload(Order.items)).order_by(Order.id.desc())
-    if view == "new":
+    if view == "new":  # "Awaiting Confirmation": COD orders to verify by phone + paid online orders to accept
         status = PENDING
-    elif view == "awaiting":
+    elif view == "confirmed":
+        status = ACCEPTED
+    elif view == "dispatched":
+        status = DISPATCHED
+    elif view in ("completed", "delivered"):
+        status = DELIVERED
+    elif view == "awaiting":  # online orders waiting for the customer's payment
         status = AWAITING_PAYMENT
     elif view == "pending_delivery":
         stmt = stmt.where(Order.status.in_([ACCEPTED, DISPATCHED]))
-    elif view == "completed":
-        status = DELIVERED
     elif view == "cancelled":
         stmt = stmt.where(Order.status.in_([CANCELLED, REJECTED]))
+    elif view == "cancel_requests":  # customer asked to cancel an order that was already dispatched
+        stmt = stmt.where(Order.status == DISPATCHED, Order.cancel_requested_at.is_not(None))
+    elif view == "refund_pending":  # money collected and not (yet) confirmed refunded
+        stmt = stmt.join(Payment, Payment.order_id == Order.id).where(
+            Payment.status == "SUCCESS",
+            (Payment.refund_status.in_(["PENDING", "PENDING_APPROVAL", "ONHOLD", "FAILED"]))
+            | (Order.status.in_([CANCELLED, REJECTED])))
+    elif view == "refunded":
+        stmt = stmt.join(Payment, Payment.order_id == Order.id).where(Payment.status == "REFUNDED")
     if status in ALL_STATUSES:
         stmt = stmt.where(Order.status == status)
     q = (q or "").strip()
@@ -300,8 +318,10 @@ def order_detail(oid: int, request: Request, db: Session = Depends(get_db), admi
         return back("/admin/orders")
     dates = delivery.available_dates(db, limit=60)
     slots = db.scalars(select(DeliverySlot).where(DeliverySlot.is_active.is_(True))).all()
+    history = db.scalars(select(AuditLog).where(AuditLog.entity == "order", AuditLog.entity_id == o.order_code)
+                         .order_by(AuditLog.id.desc()).limit(50)).all()
     return render(request, "order_detail.html", admin, o=o, next_statuses=sorted(VALID_TRANSITIONS[o.status]),
-                  dates=dates, slots=slots, nav="orders")
+                  dates=dates, slots=slots, history=history, nav="orders")
 
 
 @router.post("/orders/{oid}/status")
@@ -312,18 +332,23 @@ async def order_status(oid: int, request: Request, db: Session = Depends(get_db)
     try:
         if o is None:
             raise OrderError("not_found")
-        change_status(db, o, new, reason)
-        audit(db, admin.username, "order_status", "order", o.order_code, f"-> {new} {reason}", client_ip(request))
-        db.commit()
+        if o.status == AWAITING_PAYMENT and new == CANCELLED:
+            # unpaid online order: verify with the gateway, terminate the gateway order, release the stock
+            if payments.cancel_checkout(db, o.id, actor=admin.username, cancelled_by="ADMIN") == "paid":
+                raise OrderError("paid_meanwhile")
+            db.refresh(o)
+        else:
+            change_status(db, o, new, reason, actor=admin.username, cancelled_by="ADMIN")  # audits + row-locks
         result = notifications.notify_customer(db, o, new, reason or None)
         refund_msg = ""
         if new in (REJECTED, CANCELLED) and o.payment is not None and o.payment.status == "SUCCESS":
-            payments.refund_if_paid(db, o, f"Order {new.lower()}: {reason or 'by admin'}"[:100])
-            audit(db, admin.username, "auto_refund", "order", o.order_code, f"status {o.payment.refund_status}", client_ip(request))
-            db.commit()
-            refund_msg = f" Refund requested ({o.payment.refund_status})."
+            payments.refund_if_paid(db, o, f"Order {new.lower()}: {reason or 'by admin'}"[:100], admin.username)
+            db.refresh(o.payment)
+            refund_msg = f" Refund requested (gateway status: {o.payment.refund_status})."
             if o.payment.status == "REFUNDED":
                 notifications.notify_refunded(db, o.id)
+            else:
+                notifications.notify_refund_started(db, o.id)
         flash(request, f"Order {o.order_code} is now {new}. Customer notification: {result}.{refund_msg}")
     except OrderError as e:
         flash(request, ERRORS.get(e.code, "Could not update the order."), "err")
@@ -371,9 +396,7 @@ async def payment_refund(oid: int, request: Request, db: Session = Depends(get_d
     try:
         if o is None or o.payment is None:
             raise payments.PaymentError("not_refundable", "no payment")
-        p = payments.refund_payment(db, o.payment.id, note)
-        audit(db, admin.username, "refund", "order", o.order_code, f"{p.refund_amount} {p.refund_status} {note}", client_ip(request))
-        db.commit()
+        p = payments.refund_payment(db, o.payment.id, note, admin.username)
         if p.status == "REFUNDED":
             notifications.notify_refunded(db, o.id)
         flash(request, f"Refund of ₹{p.refund_amount} requested: {p.refund_status}.")

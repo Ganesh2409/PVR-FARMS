@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.models import AuditLog, Setting
 
 DEFAULT_SETTINGS = {
-    "farm_name": "Mango Farm",
+    "farm_name": "PVR Farms",
     "contact_number": "",
     "business_address": "Govindaraopet, Telangana",
     "business_hours": "9:00 AM - 6:00 PM",

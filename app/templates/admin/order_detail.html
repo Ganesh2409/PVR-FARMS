@@ -1,6 +1,18 @@
-{% extends "admin/base.html" %}{% block title %}{{ o.order_code }}{% endblock %}
+﻿{% extends "admin/base.html" %}{% block title %}{{ o.order_code }}{% endblock %}
 {% block content %}
-<h1>{{ o.order_code }} <span class="badge b-{{ o.status }}">{{ o.status }}</span></h1>
+<h1>{{ o.order_code }} <span class="badge b-{{ o.status }}">{{ o.status|status_label }}</span></h1>
+{% if o.cancel_requested_at and o.status == 'DISPATCHED' %}<div class="flash err"><b>âš  The customer asked to cancel this order on {{ o.cancel_requested_at|fdt }}.</b> It is already dispatched, so nothing was cancelled automatically. Call the customer, then use <i>Cancel Order</i> below if you agree (a paid order is refunded automatically).</div>{% endif %}
+{% if o.status in ('CANCELLED','REJECTED') %}<div class="flash err">{{ 'Rejected' if o.status == 'REJECTED' else 'Cancelled' }}{% if o.cancelled_by %} by <b>{{ o.cancelled_by|lower }}</b>{% endif %}{% if o.cancel_reason or o.reject_reason %}: {{ o.cancel_reason or o.reject_reason }}{% endif %}</div>{% endif %}
+{% if o.confirmed_at %}<p class="muted">Confirmed by {{ o.confirmed_by }} on {{ o.confirmed_at|fdt }} IST</p>{% endif %}
+{% if o.status == 'PENDING' %}
+<div class="card" style="border-left:5px solid var(--yellow)"><b>{% if o.payment_method == 'COD' %}Cash on Delivery. Call the customer on {{ o.contact_phone|phone }} and verify the name, address, product, quantity and delivery date. Confirm only when they really want this order.{% else %}Paid online. Please confirm this order.{% endif %}</b>
+<div class="inline" style="margin-top:.7rem"><form method="post" action="/admin/orders/{{ o.id }}/status" style="flex:0"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="new_status" value="ACCEPTED"><button class="btn">Confirm Order</button></form>
+<form method="post" action="/admin/orders/{{ o.id }}/status" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="new_status" value="REJECTED"><div><input name="reason" required maxlength="300" placeholder="Reason (e.g. could not reach customer)"></div><button class="btn danger">Reject Order</button></form></div>
+<p class="muted">If you cannot reach the customer, leave the order as it is - it stays unconfirmed (never confirmed silently).</p></div>
+{% elif o.status in ('ACCEPTED','DISPATCHED') %}
+<div class="card inline"><form method="post" action="/admin/orders/{{ o.id }}/status" style="flex:0"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="new_status" value="{{ 'DISPATCHED' if o.status == 'ACCEPTED' else 'DELIVERED' }}"><button class="btn">{{ 'Mark Dispatched' if o.status == 'ACCEPTED' else 'Mark Delivered' }}</button></form>
+<form method="post" action="/admin/orders/{{ o.id }}/status" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="new_status" value="CANCELLED"><div><input name="reason" maxlength="300" placeholder="Reason for cancelling (optional)"></div><button class="btn danger">Cancel Order</button></form></div>
+{% endif %}
 <div class="grid2">
 <div class="card"><h2 style="margin-top:0">Customer</h2><dl class="kv">
 <dt>Name</dt><dd>{{ o.customer_name }}</dd><dt>Phone</dt><dd>{{ o.contact_phone|phone }}</dd>
@@ -9,8 +21,8 @@
 <dt>Village</dt><dd>{{ o.village_name }}</dd><dt>Address</dt><dd>{{ o.address }}</dd><dt>Landmark</dt><dd>{{ o.landmark or '-' }}</dd></dl></div>
 <div class="card"><h2 style="margin-top:0">Order</h2><dl class="kv">
 {% for i in o.items %}<dt>Item</dt><dd>{{ i.product_name_en }}<br><span class="muted">{{ i.product_name_te }}</span></dd>
-<dt>Quantity</dt><dd>{{ i.quantity|qty }} kg × ₹{{ i.price_per_kg|money }}</dd>{% endfor %}
-<dt>Subtotal</dt><dd>₹{{ o.subtotal|money }}</dd><dt>Delivery</dt><dd>₹{{ o.delivery_charge|money }}</dd><dt>Total</dt><dd><b>₹{{ o.total|money }}</b></dd>
+<dt>Quantity</dt><dd>{{ i.quantity|qty }} kg Ã— â‚¹{{ i.price_per_kg|money }}</dd>{% endfor %}
+<dt>Subtotal</dt><dd>â‚¹{{ o.subtotal|money }}</dd><dt>Delivery</dt><dd>â‚¹{{ o.delivery_charge|money }}</dd><dt>Total</dt><dd><b>â‚¹{{ o.total|money }}</b></dd>
 <dt>Delivery date</dt><dd>{{ o.delivery_date|fdate }} {{ o.slot_name or '' }}</dd><dt>Payment</dt><dd>{{ o.payment_method }} ({{ o.payment_status }})</dd>
 <dt>Placed</dt><dd>{{ o.created_at|fdt }} IST</dd>
 {% if o.reject_reason %}<dt>Rejected</dt><dd>{{ o.reject_reason }}</dd>{% endif %}{% if o.cancel_reason %}<dt>Cancelled</dt><dd>{{ o.cancel_reason }}</dd>{% endif %}</dl></div>
@@ -18,14 +30,14 @@
 {% set pay = o.payment %}
 <h2>Payment</h2>
 <div class="card"><dl class="kv">
-<dt>Method</dt><dd>{{ o.payment_method }} · order payment status: <b>{{ o.payment_status }}</b></dd>
+<dt>Method</dt><dd>{{ o.payment_method }} Â· order payment status: <b>{{ o.payment_status }}</b></dd>
 {% if pay %}
 <dt>Payment state</dt><dd><span class="badge b-{{ {'SUCCESS':'DELIVERED','PENDING':'PENDING','FAILED':'CANCELLED','EXPIRED':'CANCELLED','REFUNDED':'DISPATCHED'}[pay.status] }}">{{ pay.status }}</span>
 {% if pay.closed_reason %} ({{ pay.closed_reason }}){% endif %}</dd>
 <dt>Provider</dt><dd>{{ pay.provider }}</dd>
-<dt>Amount</dt><dd>₹{{ pay.amount|money }} {{ pay.currency }}</dd>
+<dt>Amount</dt><dd>â‚¹{{ pay.amount|money }} {{ pay.currency }}</dd>
 <dt>Gateway order ID</dt><dd>{{ pay.provider_order_id }} {% if pay.cf_order_id %}(cf_order_id {{ pay.cf_order_id }}){% endif %}</dd>
-<dt>Payment session</dt><dd><code>{{ (pay.payment_session_id or '-')[:18] }}…</code></dd>
+<dt>Payment session</dt><dd><code>{{ (pay.payment_session_id or '-')[:18] }}â€¦</code></dd>
 <dt>Transaction ref</dt><dd>{{ pay.cf_payment_id or '-' }}</dd>
 <dt>Bank reference</dt><dd>{{ pay.bank_reference or '-' }}</dd>
 <dt>Method used</dt><dd>{{ pay.payment_group or '-' }}</dd>
@@ -33,24 +45,29 @@
 <dt>Paid at</dt><dd>{{ (pay.paid_at|fdt) or '-' }}</dd>
 <dt>Link expires</dt><dd>{{ pay.expires_at|fdt }}</dd>
 {% if pay.failure_reason %}<dt>Last failure</dt><dd>{{ pay.failure_reason }}</dd>{% endif %}
-{% if pay.refund_id %}<dt>Refund</dt><dd>{{ pay.refund_id }} · ₹{{ pay.refund_amount|money }} · <b>{{ pay.refund_status }}</b>{% if pay.refunded_at %} · {{ pay.refunded_at|fdt }}{% endif %}</dd>{% endif %}
-{% if pay.needs_attention %}<dt>⚠ Attention</dt><dd class="bad" style="color:#c0392b">{{ pay.needs_attention }}</dd>{% endif %}
+{% if pay.refund_id %}<dt>Refund</dt><dd>{{ pay.refund_id }} Â· â‚¹{{ pay.refund_amount|money }} Â· <b>{{ pay.refund_status }}</b>{% if pay.refunded_at %} Â· {{ pay.refunded_at|fdt }}{% endif %}</dd>{% endif %}
+{% if pay.needs_attention %}<dt>âš  Attention</dt><dd class="bad" style="color:#c0392b">{{ pay.needs_attention }}</dd>{% endif %}
 </dl>
 <form method="post" action="/admin/orders/{{ o.id }}/payment/refresh" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="btn sm ghost">Re-check with gateway</button></form>
 {% if pay.status == 'SUCCESS' %}
-<form method="post" action="/admin/orders/{{ o.id }}/payment/refund" class="inline" style="margin-top:.8rem" onsubmit="return confirm('Refund ₹{{ pay.amount|money }} to the customer?')"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+<form method="post" action="/admin/orders/{{ o.id }}/payment/refund" class="inline" style="margin-top:.8rem" onsubmit="return confirm('Refund â‚¹{{ pay.amount|money }} to the customer?')"><input type="hidden" name="csrf_token" value="{{ csrf }}">
 <div><label>Refund note</label><input name="note" maxlength="100" placeholder="Reason"></div><button class="btn sm danger">Refund in full</button></form>
 <p class="muted">Rejecting or cancelling a paid order refunds it automatically.</p>{% endif %}
 {% elif o.payment_method == 'COD' %}<p class="muted">Cash on Delivery: collected by the delivery person.</p>{% endif %}
 </div>
 {% if next_statuses %}<h2>Update status</h2>
 <form method="post" action="/admin/orders/{{ o.id }}/status" class="card inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
-<div><label>New status</label><select name="new_status">{% for s in next_statuses %}<option>{{ s }}</option>{% endfor %}</select></div>
+<div><label>New status</label><select name="new_status">{% for s in next_statuses %}<option value="{{ s }}">{{ s|action_label }}</option>{% endfor %}</select></div>
 <div><label>Reason (required for REJECTED)</label><input name="reason" maxlength="300"></div><button class="btn">Update &amp; notify customer</button></form>{% endif %}
 {% if o.status in ('PENDING','ACCEPTED') %}<h2>Change delivery date</h2>
 <form method="post" action="/admin/orders/{{ o.id }}/date" class="card inline"><input type="hidden" name="csrf_token" value="{{ csrf }}">
 <div><label>New date</label><select name="date">{% for d in dates %}<option value="{{ d.row.date.isoformat() }}">{{ d.row.date|fdate }} ({{ d.remaining }} slots left)</option>{% endfor %}</select></div>
 <div><label>Time slot (if the date uses slots)</label><select name="slot_id"><option value="">-</option>{% for s in slots %}<option value="{{ s.id }}">{{ s.name_en }}</option>{% endfor %}</select></div>
 <button class="btn alt">Change date</button></form>{% endif %}
-<p><a href="/admin/orders">← All orders</a></p>
+<h2>History</h2>
+<div class="tablewrap"><table><tr><th>When (IST)</th><th>Who</th><th>What</th><th>Details</th></tr>
+{% for h in history %}<tr><td>{{ h.created_at|fdt }}</td><td>{{ h.admin_username }}</td><td>{{ h.action }}</td><td>{{ h.details }}</td></tr>
+{% else %}<tr><td colspan="4" class="muted">No recorded actions yet.</td></tr>{% endfor %}</table></div>
+<p><a href="/admin/orders">â† All orders</a></p>
 {% endblock %}
+
